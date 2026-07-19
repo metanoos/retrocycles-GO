@@ -130,6 +130,53 @@ generated in code for any missing prefab, so the game runs with zero art.
 | Phoenix | Phoenix | amber `(1,.6,0)` | 20 |
 | Waveform | Waveform | electric-blue `(.4,.6,1)` | 25 |
 
+### 1.5 Active Decisions (2026-07-18) — Lightfield Match Core
+
+The 4-axis score-and-crash-ends-the-run game described in §1.4 / §2 has been
+**superseded in flight by a parallel match-core migration** ("the Lightfield
+match core"). A 6-track parallel effort (A/B/C/D/E/F/G) replaced the open-ended
+run loop with a **timed host-authoritative match** where players collect
+**Lumens** by touching gates, crash is no longer terminal (you respawn with a
+Lumen penalty), and the highest Lumen count at clock expiry wins. This is the
+**authoritative** design; the legacy text below remains for provenance and is
+marked "DELETED"/"DEPRECATED" where it conflicts.
+
+22 decisions were made; **19 are implemented** in this milestone, **3 are
+deferred to v2** (decision S):
+
+| Decision | Topic | Status |
+|---|---|---|
+| A | Completed trails persist as neon world art ("Afterglow") | ✅ (overview camera) |
+| B | Lumen Gate visual contract (hemisphere + trigger) | ✅ |
+| C | Integer Lumen tally is the sole score primitive | ✅ |
+| D | Emergence grace: own trail cannot kill for N s after start | ✅ |
+| E | RunScorer DELETED — replaced by integer Lumen tally (see §7.4) | ✅ |
+| F | Crash is no longer terminal: penalty + respawn; drops a stealable Lumen | ✅ |
+| G | Lumen Gates as the collection primitive | ✅ |
+| H | AR is the primary view; map is a corner radar | ✅ |
+| I | Leader identity always visible (crown + off-screen indicator) | ✅ |
+| K | Hemispherical play volume ("Lightfield"); ground disc + ceiling for milestone | ✅ |
+| L | Ground-only Gate placement; aerial deferred (decision S) | ✅ |
+| M | Gate density formula: `max(1, ceil(players × gatesPerPlayer))` | ✅ |
+| N | Sweep-subdivide long teleports for collision (vehicle / GPS jump) | ✅ |
+| O | Timed match; most Lumens wins on clock expiry (default 6 min) | ✅ |
+| P | Match is a strict sub-FSM on top of `GameState` (decision-P architecture) | ✅ |
+| Q | **Shared Mode → Host Mode** (authoritative host); see §8.1 | ✅ |
+| R | Referee as a validated command client (NOT state authority); v2 UI deferred | ✅ token+PlaceBonusGate |
+| S | Aerial flight + full Gate-Director UI + Afterglow Walk-Inside | ⏸ deferred v2 |
+| T | Tail radius frozen at countdown, preserved in Afterglow | ✅ |
+| U | Afterglow is ONE package, two views (Overview/Walk-Inside) | ✅ (Overview) |
+| V | (reserved) | — |
+| — | Backend match schema: `matches` / `match_players` tables + RPCs | ✅ (Track E) |
+
+**Deferred (decision S):** aerial flight (full orb gates at altitude bands),
+the full referee Gate-Director UI (decision R v2), and the Afterglow
+Walk-Inside view (immersive replay camera). All three are stubbed in the
+milestone — the contracts are stable so v2 is additive.
+
+A new "Lightfield Architecture" subsection (see end of §3) lists the 7 Core
+match contracts and which assembly implements each.
+
 ---
 
 ## 3. Architecture
@@ -207,6 +254,64 @@ never references platform-specific code — enforced by the compiler.
 - `FUSION_WEAVER` — `FusionLauncher`, `NetworkPlayer`, `NetworkTrailSync`, the
   prefab generator, and the `Connect`/`Disconnect` calls in `GameManager`.
 
+### 3.6 Lightfield Architecture (active decisions 2026-07-18)
+
+The match core is built on **7 Core interfaces**, each owned by exactly one
+implementing assembly. Implementations register on the `ServiceLocator`
+(§3.1) at match start; `PlatformServiceRegistry` installs `Null*` stubs first
+so the editor runs before any track is merged.
+
+| Interface | Implementing assembly | Constructing class |
+|---|---|---|
+| `IMatchSession` | `LightRunners.Gameplay` (Track D) | `MatchManager` (singleton MonoBehaviour; sub-FSM `Idle→Warmup→Countdown→Live→Scoring→Expired`) |
+| `ILumenScoreboard` | `LightRunners.Trail` (Track A) | `LumenScoreboard` (pure C#; integer tally; leader + dropped-Lumen queue) |
+| `IGateDirector` | `LightRunners.Lightfield` (Track B) | `GateSpawner` (pure C#; density pool + bonus gates) |
+| `ILightfieldVolume` | `LightRunners.Lightfield` (Track B) | `LightfieldVolume` (pure C#; disc + ceiling; boundary-violation events) |
+| `IMatchTransport` | `LightRunners.Multiplayer` (Track C) | `FusionLauncher` (host mode; `NullMatchTransport` offline fallback) |
+| `IMatchReplaySink` | `LightRunners.Afterglow` (Track F) | `ReplayPackageSink` (pure C#; accumulates `ReplayPackage`, finalizes on MatchExpired) |
+| `ITailAuthority` | `LightRunners.Trail` (Track A) | `TailAuthority` (pure C#; tail radius frozen at countdown) |
+
+**Why pure-C# hosts over MonoBehaviours:** the host authorities (scoreboard,
+gate director, lightfield volume, replay sink, tail authority) are pure logic
+with no Unity lifecycle needs, so they're plain C# classes registered on the
+locator. `MatchManager` constructs and registers them in `Awake`, overwriting
+the `Null*` stubs. The scene generator (`SceneSetup`) therefore does NOT place
+GameObject stand-ins for these — `TryAddType` is a graceful no-op for non-
+MonoBehaviour types, and the calls stay in place so a future conversion wires
+automatically.
+
+**Cross-track event flow:**
+
+```
+GameEvents (static bus, Core)
+  ├─ GateCollected(gateId, playerId)   ← LumenGate / StolenLumenPickup (Track B)
+  │                                     → LumenScoreboard.Award (Track A)
+  │                                     → ReplayPackageSink.RecordLumen (Track F)
+  ├─ LumensChanged(playerId, newTotal) ← LumenScoreboard (Track A)
+  │                                     → StolenLumenPickupSpawner (Track B, heuristic)
+  │                                     → TacticalRadar / LeaderCrown (Track D)
+  │                                     → ReplayPackageSink (Track F)
+  ├─ LeaderChanged(newLeaderId)        ← LumenScoreboard (Track A)
+  │                                     → LeaderCrown / OffScreenIndicator (Track D)
+  ├─ GateSpawned / GateDespawned       ← GateSpawner (Track B)
+  │                                     → TacticalRadar (Track D)
+  ├─ BoundaryViolated(playerId)        ← LightfieldVolume (Track B)
+  ├─ PlayerCrashed(playerId)           ← GameManager (single listener; delegates to MatchManager)
+  ├─ MatchExpired                      ← MatchManager (Track D)
+  │                                     → ReplayPackageSink.Finalize (Track F)
+  │                                     → AfterglowViewController.Show (Track F)
+  └─ ConnectionStateChanged            ← FusionLauncher (Track C)
+                                        → MatchManager (online/offline host detection)
+```
+
+**Scene wiring (Track G):** the Game scene gets five new GameObjects/stacks —
+`MatchManager`, `ViewModeBootstrap`, `Afterglow` (with `OverviewCamera` child),
+`MatchHUD` canvas (carrying `TacticalRadar`/`OffScreenIndicator`/`LeaderCrown`)
+— plus `NetworkMatchState` is spawned by the host from a Resources prefab at
+match start. `LightfieldVolume` and `GateSpawner` are NOT in the scene — they
+are pure-C# hosts the MatchManager constructs. See §14.2 for the full scene
+manifest and §14.3 for the new prefab menu.
+
 ---
 
 ## 4. Core data model (`LightRunners.Core`)
@@ -259,8 +364,23 @@ can find knobs:
 | Map/OSM | `osmTileUserAgent`, `osmMinimapSize`, `osmDefaultZoom`, `osmMaxConcurrentRequests`, `osmTileRequestInterval`, `osmTileCacheSize`, `defaultLatitude`, `defaultLongitude` | "LightRunners/1.0", 200, 16, 2, 1.0 s, 64, 37.7749, -122.4194 |
 | AR | `arTrailRenderDistance`, `arMaxNearbyTrails` | 50 m, 50 |
 | Beacon | `beaconBaseScale`, `beaconBobAmplitude`, `beaconBobFrequency`, `beaconGlowIntensity`, `beaconRotationSpeed` | 1, 0.1, 2, 2, 45 |
-| Scoring | `proximitySampleInterval`, `proximityRadius` | 10 s, 100 m |
+| Scoring *(DEPRECATED — decision E)* | `proximitySampleInterval`, `proximityRadius` | 10 s, 100 m |
 | Lifecycle | `backgroundGraceSeconds` | 60 s |
+| **Lightfield Match** *(active decisions 2026-07-18 — see §1.5, §3.6)* | `gatesPerPlayer`, `gateCollectionRadius`, `tailRadius`, `matchDurationSeconds`, `matchCountdownSeconds`, `crashLumenLossNonLeader`, `crashLumenLossLeader`, `stolenLumenPickupSeconds`, `emergenceGraceSeconds`, `lightfieldBaseRadiusMeters`, `lightfieldDomeCeilingMeters`, `sweepSubdivideMaxStepMeters` | 0.5, 2.0 m, 0.5 m, 360 s, 3 s, 1, 2, 8 s, 2 s, 50 m, 6 m, 2 m |
+
+> **Lightfield fields:** `gatesPerPlayer` is the density ratio
+> (decision M: `activeGateCount = max(1, ceil(players × gatesPerPlayer))`);
+> `gateCollectionRadius` is the Lumen Gate trigger (decision G);
+> `tailRadius` is the authoritative frozen tail (decision T);
+> `matchDurationSeconds` is the host-tunable match clock (decision O);
+> `crashLumenLossLeader` / `NonLeader` are the tier-scaled crash penalties
+> (decision F); `stolenLumenPickupSeconds` is the stealable-Lumen lifetime
+> (decision F); `emergenceGraceSeconds` extends `trailGracePeriod` so a freshly
+> spawned runner can't re-crash into their own tail (decision D);
+> `lightfieldBaseRadiusMeters` / `lightfieldDomeCeilingMeters` define the
+> ground disc + altitude ceiling stub (decision K; full dome deferred per
+> decision S); `sweepSubdivideMaxStepMeters` sub-sweeps long teleports so a
+> vehicle move / GPS jump can't tunnel through a wall (decision N).
 
 **Two grace mechanisms, two jobs — don't conflate them:**
 - `selfCollisionSkipPoints` (count) — the *self-collision* grace: the newest N
@@ -405,8 +525,22 @@ Holds `Dictionary<playerId, TrailData>`, plus the special `_localTrail`.
   difference `< collisionThreshold·2`. Fires `OnCollisionDetected(ownerId)`.
 - **Reentrancy guard** (`_isChecking`) — a single check can't overlap itself.
 
-### 7.4 `RunScorer` (static)
-`Calculate(trail, duration, otherPlayersNearby)` → `RunScore`:
+### 7.4 `RunScorer` (static) — DEPRECATED
+
+> **DELETED (decision E, 2026-07-18).** Track E removed `RunScorer`, the
+> 4-axis `RunScore` struct, the `record_run` RPC's score columns, and the
+> corresponding 16 EditMode tests (one per axis table + guards + proximity
+> sampler). The authoritative score primitive is now the **integer Lumen
+> tally** on `ILumenScoreboard` (Track A's `LumenScoreboard`), one Lumen per
+> Gate touch (decision C). The 4-axis formula below is **historical**,
+> preserved for provenance; new code MUST NOT call `RunScorer.Calculate`.
+>
+> See §1.5 for the active decisions map and §3.6 for the new match-contract
+> architecture. The `RunSummaryUI` was refactored to read the Lumen tally;
+> `record_match_player` (Track E's schema, §12.5) persists `lumen_count` not
+> the 4 axis scores.
+
+`Calculate(trail, duration, otherPlayersNearby)` → `RunScore` *(historical)*:
 
 | Component | Max | Rule |
 |---|---|---|
@@ -415,16 +549,19 @@ Holds `Dictionary<playerId, TrailData>`, plus the special `_localTrail`.
 | Beauty | 30 | `0.7·curve + 0.3·alt`; curve = avg abs heading change per segment, normalized `clamp01(deg/30)`, scaled down linearly above 60° (0 again at 120°); alt = `clamp01(altitudeRange_m / 50)` where altitudeRange = max−min altitude over the run |
 | Proximity | 10 | `min(peakNearby, 5) · 2` |
 
-`totalScore` is the rounded sum. Persisted via the `record_run` RPC.
+`totalScore` was the rounded sum. Persisted via the (now-removed) `record_run`
+RPC. The 16 deleted EditMode tests covered the axis tables + null-trail /
+<2-point / zero-duration guards + the proximity sampler fix (pitfall #17).
 
-**Proximity input — sample during the run, not at the end.** While `Running`,
-`GameManager` samples `TrailManager.CountPlayersNear(currentPos,
-proximityRadius, localId)` every `proximitySampleInterval` (defaults: 100 m /
-10 s) and keeps the **maximum** observed (`peakNearby`). That peak is what
-`Calculate` receives. *The phase-4 code instead samples once at end-of-run
-within `collisionCheckRadius` (5 m) — which is ~always 0 and makes the axis
-dead (pitfall #17). `CountPlayersNear` measures against each remote trail's
-newest point, i.e. that runner's live position.*
+**Proximity input — sample during the run, not at the end.** *(Historical
+context — no longer wired.)* While `Running`, `GameManager` sampled
+`TrailManager.CountPlayersNear(currentPos, proximityRadius, localId)` every
+`proximitySampleInterval` (defaults: 100 m / 10 s) and kept the **maximum**
+observed (`peakNearby`). That peak was what `Calculate` received. *The phase-4
+code instead sampled once at end-of-run within `collisionCheckRadius` (5 m) —
+which was ~always 0 and made the axis dead (pitfall #17). `CountPlayersNear`
+measures against each remote trail's newest point, i.e. that runner's live
+position.*
 
 ### 7.5 Rendering & LOD
 - `NeonTrailRenderer` (`[RequireComponent(LineRenderer)]`) — builds a
@@ -452,7 +589,38 @@ reset `timeScale` in `OnDestroy`.
 ## 8. Multiplayer (`LightRunners.Multiplayer`, gated `FUSION_WEAVER`)
 
 ### 8.1 `FusionLauncher` (singleton, `INetworkRunnerCallbacks`)
-- **Shared mode** (`GameMode.Shared`) — every client has authority over its own
+
+> **DIVERGENCE (decision Q, 2026-07-18): the migration from Shared Mode to
+> Host Mode is authoritative.** Track C rewrote `FusionLauncher` as an
+> `IMatchTransport` host-authoritative singleton: the host owns the
+> authoritative match state (`NetworkMatchState`), the frozen tail radius
+> (decision T), and is the sole validator of referee commands (decision R).
+> `MatchManager.IsHostAuthority` resolves `IMatchTransport.IsHost`
+> reflectively; in offline/editor mode `NullMatchTransport` returns `true` so
+> the FSM drives correctly without a network. The **Shared-Mode text below is
+> historical** (preserved verbatim for provenance); new code MUST assume Host
+> Mode. The friend-match code-name scheme (§8.5), the room-name floor-rounding
+> invariant, and the offline-badge fallback all carry over unchanged.
+
+#### Authoritative behavior (Host Mode, decision Q)
+- The first client to enter an empty room becomes the host (State Authority
+  on the match-scoped `NetworkObject`s).
+- The host spawns **`NetworkMatchState`** (`Resources/Player/NetworkMatchState.prefab`,
+  generated by the editor — see §14.3) at match start; it carries the
+  `[Networked] FrozenTailRadius` (decision T). Clients receive the host's
+  value via Fusion's `OnChanged` callback and propagate it to their local
+  `ITailAuthority`.
+- The host is the sole constructor of the pure-C# authorities
+  (`LumenScoreboard`, `TailAuthority`, `GateSpawner`, `LightfieldVolume`) —
+  clients read state through the networked props + replicated trail sync (§8.2).
+- **Referee (decision R):** a separate `RefereeClient` `NetworkBehaviour`
+  presents a host-issued token; the host validates it via
+  `RefereeTokenValidator.Validate` before forwarding any Gate-Director
+  command. The referee has NO State Authority. v2 will add the full
+  Gate-Director UI (decision S deferral).
+
+#### Historical behavior (Shared Mode, superseded)
+- **Shared mode** (`GameMode.Shared`) — every client had authority over its own
   avatar; no dedicated host.
 - `Connect(roomName, playerId)` — creates a `NetworkRunner`, calls
   `StartGame`, on success spawns the local avatar and stamps its `PlayerId`.
@@ -881,23 +1049,48 @@ HUDCanvas (sortingOrder 10)
     DistanceScoreText/SpeedScoreText/BeautyScoreText/ProximityScoreText
     RunAgainButton, ContinueButton
     + RunSummaryUI
+# Lightfield match core (active decisions 2026-07-18 — see §1.5 / §3.6)
+MatchManager               (Track D — sub-FSM; constructs LumenScoreboard/TailAuthority/GateSpawner/LightfieldVolume/ReplayPackageSink in Awake)
+ViewModeBootstrap          (Track D — decision H; forces AR on Start)
+Afterglow/                 (Track F — decision A/U; toggled on MatchExpired)
+  OverviewCamera           (Track F — top-down orthographic; frames captured trails)
+  + AfterglowViewController (Track F — overviewView=OverviewCamera; walkInsideView=null per decision S)
+MatchHUD (Canvas sortingOrder 11)
+  + TacticalRadar          (Track D — decision H; gate + runner blips; self-builds ring/blips)
+  + OffScreenIndicator     (Track D — decision I; screen-edge arrows; leader tint)
+  + LeaderCrown            (Track D — decision I; follows leader's projected pos)
 EventSystem + StandaloneInputModule
 Player/                   (spawned at runtime from Resources/Player/NetworkPlayer.prefab)
+NetworkMatchState         (host spawns from Resources/Player/NetworkMatchState.prefab at match start; NOT scene-placed — NetworkObjects live on a NetworkRunner)
+# Pure-C# hosts NOT in the scene — MatchManager constructs and registers them on the ServiceLocator:
+#   LumenScoreboard, TailAuthority (Track A) ; GateSpawner, LightfieldVolume (Track B) ; ReplayPackageSink (Track F)
 ```
 
 ### 14.3 Editor menu (`Light-Runners/Setup`)
 - **Generate All Scenes** — Login + Game.
 - **Login Scene / Game Scene** — individually.
-- **Ensure GameConfig Asset** — creates `Resources/GameConfig.asset` if absent.
+- **Ensure Project Assets (URP + GameConfig)** — `[InitializeOnLoad]` once per
+  session; creates `Assets/Settings/URP/URPAsset.asset` and
+  `Resources/GameConfig.asset` if absent.
 - **NetworkPlayer Prefab** (FUSION_WEAVER) — minimal prefab:
   `NetworkObject` + `NetworkPlayer` + `NetworkTrailSync`. *Do not* add beacon or
   collision components here — `NetworkPlayer.Spawned` builds those at runtime,
   and duplicating them would double the beacon and the collision check.
+- **NetworkMatchState Prefab** (FUSION_WEAVER, Track C, decision Q/T) — minimal
+  prefab: `NetworkObject` + `NetworkMatchState`. The host spawns one per match
+  at match start; it carries the `[Networked] FrozenTailRadius`. Not scene-
+  placed (NetworkObjects live on a NetworkRunner).
 - **Beacon Prefabs** — the 8 beacon prefabs in `Resources/Beacons/`.
-- **All Prefabs** — NetworkPlayer + Beacons.
-- **Tools → Validate Setup** — `SetupValidator` EditorWindow checks GameConfig,
-  Fusion present, auth service present, both scenes in Build Settings, beacon
-  prefabs exist, Supabase URL non-empty.
+- **Gate Prefabs** (Track B, decisions G/L/M/R) — `Resources/Gates/LumenGate.prefab`
+  and `Resources/Gates/StolenLumenPickup.prefab`. Recipe per prefab: a
+  `SphereCollider` (isTrigger) + the behaviour. The visual hemisphere / orb is
+  built in code at runtime, so the prefab ships with zero art.
+- **All Prefabs** — Beacons + NetworkPlayer + Gates + NetworkMatchState.
+- **Tools → Validate Setup** — `SetupValidator` EditorWindow checks GameConfig
+  (+ Lightfield fields non-default), both scenes in Build Settings, beacon
+  prefabs, gate prefabs, Supabase URL, URP pipeline, AR Foundation, Fusion,
+  custom shaders, Lightfield/Afterglow assemblies present, MatchManager in
+  Game scene.
 
 > **Build Settings:** both scenes must be added; Login at index 0.
 
@@ -1080,6 +1273,36 @@ Each phase leaves a compiling, runnable project.
 12. **Device verification (human checkpoints).** GPS trail recording; AR camera
     + trails; two-phone multiplayer crash; Supabase RLS cross-player write test;
     iOS TestFlight + signed APK.
+13. **Lightfield match core (active decisions 2026-07-18 — parallel tracks
+    A/B/C/D/E/F/G; see §1.5 / §3.6).** Seven parallel tracks land a
+    host-authoritative timed match on top of phases 1–12:
+    - **Track A** (`Trail/`): `LumenScoreboard`, `SnakeTailModel`,
+      `TailAuthority`, sweep subdivision (decisions C/E/F/I/N/T). Replaces the
+      `RunScorer` score primitive with the integer Lumen tally.
+    - **Track B** (`Lightfield/`): `LightfieldVolume`, `GateSpawner`,
+      `LumenGate`, `StolenLumenPickup` (decisions G/K/L/M/R).
+    - **Track C** (`Multiplayer/`): `FusionLauncher` migrates **Shared → Host
+      Mode** (decision Q); `NetworkMatchState` replicates the frozen tail
+      radius (decision T); `RefereeClient` + `RefereeTokenValidator` for
+      validated bonus-gate commands (decision R).
+    - **Track D** (`Gameplay/` + `UI/`): `MatchManager` sub-FSM (decision P),
+      `ViewModeBootstrap` (decision H — AR-primary), `TacticalRadar` /
+      `OffScreenIndicator` / `LeaderCrown` (decisions H/I), `RunSummaryUI`
+      refactor to read the Lumen tally.
+    - **Track E** (`Backend/` + `Supabase/`): drops `RunScorer` columns and
+      `record_run` RPC; adds `matches` / `match_players` tables +
+      `record_match_player` RPC; `crash_lumen_loss_*` persistence.
+    - **Track F** (`Afterglow/`): `ReplayPackage`, `ReplayPackageSink`,
+      `OverviewCameraController`, `AfterglowViewController` (decisions A/U/T/S —
+      Walk-Inside stubbed per decision S).
+    - **Track G** (`Editor/`): scene generator + prefab generator + validator
+      wiring for all of the above; SPEC/README updates.
+
+    Each track compiles independently of the others (reflection-driven scene
+    wiring + `Null*` ServiceLocator stubs). Verify after merge: a single editor
+    session can Start Match → countdown → live → touch a gate (+1 Lumen) →
+    crash (penalty + respawn) → clock expiry → Afterglow Overview showing the
+    finished trails at the frozen tail radius.
 
 ---
 
@@ -1251,9 +1474,27 @@ Pins for what phases 4–5 currently leave to taste:
 
 ## 26. Automated tests (EditMode — pure-C# seams)
 
-The architecture already isolates pure logic; test it. One `LightRunners.Tests`
-editor asmdef (refs: Core, Trail, Location), Unity Test Framework, runnable via
-`Window → General → Test Runner` and CI-able via `-runTests`:
+The architecture already isolates pure logic; test it. The original phase-1–4
+seam lived in one `LightRunners.Tests` editor asmdef (refs: Core, Trail,
+Location). The Lightfield match core (§1.5, 2026-07-18) splits tests across
+per-track asmdefs so each track's tests compile + run independently of the
+others — a track can be merged without forcing the others' tests to land.
+Unity Test Framework throughout; runnable via `Window → General → Test Runner`
+and CI-able via `-runTests`.
+
+**Per-track asmdefs (Lightfield match core):**
+
+| Asmdef | Refs | Covers |
+|---|---|---|
+| `LightRunners.Tests` (original) | Core, Trail, Location | The original phase-1–4 cases below (sans the deleted `RunScorer` rows) |
+| `LightRunners.Tests.Trail` | Core, Trail | `LumenScoreboard` integer tally + leader math + dropped-Lumen queue; `TailAuthority` freeze/unfreeze; `SnakeTailModel` sweep-subdivide (Track A) |
+| `LightRunners.Tests.Lightfield` | Core, Lightfield | `LightfieldGeometry` disc + ceiling; `LightfieldVolume` boundary-violation dedup; `GateDensity.ActiveGateCount` table; `GateSpawner` density-pool + bonus-gate + referee-token gate (Track B) |
+| `LightRunners.Tests.Backend` | Core, Backend | `RefereeTokenValidator` token-validate; `matches` / `match_players` RPC round-trip; RunScorer columns absent (Track E) |
+| `LightRunners.Tests.Afterglow` | Core, Afterglow | `ReplayPackageSink` accumulate + finalize idempotency; `ReplayPackage` round-trip; selection/focus preserved across view switches (Track F) |
+| `LightRunners.Tests.Multiplayer` | Core, Multiplayer (FUSION_WEAVER) | `NetworkMatchState` frozen-radius propagation contract; `RefereeClient` validate-then-forward (Track C) |
+| `LightRunners.Tests.Gameplay` | Core, Gameplay | `MatchManager` FSM transitions; crash double-handling contract; offline `IsHostAuthority` fallback (Track D) |
+
+**Original phase-1–4 cases (in `LightRunners.Tests`):**
 
 | Area | Cases |
 |---|---|
@@ -1262,11 +1503,14 @@ editor asmdef (refs: Core, Trail, Location), Unity Test Framework, runnable via
 | `TrailData` | accumulator `TotalLength` unchanged by `PruneTo`; `AddPoint` sequence gating; `IsSameRun` truth table |
 | Merge (§7.2) | out-of-order + overlapping batches idempotent; merge correct *after* pruning (cursor, not count) |
 | `TrailSnapshot` | encode/decode round-trip < 5 cm at longitude −122° (guards pitfall #16); empty/short trails |
-| `RunScorer` | table tests per axis: 0 / mid / cap for distance & speed; straight line ≈ 0 beauty; gentle curves > tight spiral (>60° penalty); proximity 0/3/5/8 players → 0/6/10/10 |
+| ~~`RunScorer`~~ | **DELETED (decision E).** The 16 cases (axis tables + null-trail / <2-point / zero-duration guards + proximity sampler) were removed with the class — Track E. |
 | Collision math | segment-intersection truth table incl. collinear, shared-endpoint, near-miss at threshold ± ε; grace-skip window boundaries (`skipRecent` = 0, N, count−1) |
-| `RunScorer` guards | null trail, < 2 points, zero duration → total 0 |
+| ~~`RunScorer` guards~~ | **DELETED (decision E).** |
 
 PlayMode smoke (editor, scene-generated): Login → Lobby → Running → crash via a
 scripted self-loop → `Crashed` → summary visible → Continue → `Lobby`; assert
-`timeScale == 1` at the end. Keep it to the one golden path — the sim already
-makes manual testing cheap.
+`timeScale == 1` at the end. *(The Lightfield match core extends this to
+Start Match → Countdown → Live → touch-a-gate → crash-and-respawn →
+MatchExpired → Afterglow Overview, but the original golden path stays the
+single canonical smoke.)* The sim already makes manual testing cheap.
+

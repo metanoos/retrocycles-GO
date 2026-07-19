@@ -2,6 +2,7 @@
 using System.IO;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.SceneManagement;
 using UnityEngine.Rendering;
 using LightRunners.Core;
 
@@ -107,6 +108,17 @@ namespace LightRunners.Editor
                 if (Shader.Find(s) != null) shaders++;
             sb.AppendLine($"[{(shaders == 3 ? "PASS" : "WARN")}] Custom shaders present ({shaders}/3; fallback materials cover gaps)");
 
+            // ───────────────────────────────────────────────────────────────
+            // Lightfield match core (Track G — active decisions 2026-07-18).
+            // All WARN-level: the editor still runs on a Phase-0 worktree; a
+            // missing track or unconfigured field is a designer hint, not a
+            // blocker. See SPEC §1.5 for the decision map.
+            // ───────────────────────────────────────────────────────────────
+            ValidateLightfieldFields(sb, cfg, ref pass);
+            ValidateLightfieldPrefabs(sb, ref pass);
+            ValidateLightfieldAssemblies(sb, ref pass);
+            ValidateMatchManagerInGameScene(sb, ref pass);
+
             sb.AppendLine();
             sb.AppendLine($"Total: {pass} pass / {fail} fail (warnings do not block editor playmode).");
             _lastRunAllPassed = fail == 0;
@@ -119,6 +131,134 @@ namespace LightRunners.Editor
             foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
                 if (asm.GetType(fullTypeName) != null) return true;
             return false;
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Lightfield match-core validators (Track G — active decisions 2026-07-18)
+        //
+        // All WARN-level: the editor still runs on a Phase-0 worktree or with
+        // one or more tracks unmerged. A missing field/prefab/assembly is a
+        // designer hint, not a playmode blocker. See SPEC §1.5 for the
+        // decision map.
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Decision M / G / T / O / K — checks the Lightfield tunables on
+        /// <see cref="GameConfig"/> are non-default. WARN (not FAIL): the
+        /// defaults are playable, but a zeroed field indicates the bootstrap
+        /// hasn't been refreshed or the asset is stale.
+        /// </summary>
+        private static void ValidateLightfieldFields(System.Text.StringBuilder sb, GameConfig cfg, ref int pass)
+        {
+            if (cfg == null) return; // already reported by the GameConfig row above.
+
+            // gatesPerPlayer > 0 (decision M — density formula floor is 1, but 0 means
+            // "no gates ever", almost certainly a stale config).
+            bool gatesOk = cfg.gatesPerPlayer > 0f;
+            sb.AppendLine($"[{(gatesOk ? "PASS" : "WARN")}] GameConfig.gatesPerPlayer > 0 (currently {cfg.gatesPerPlayer}; decision M)");
+            if (gatesOk) pass++;
+
+            // tailRadius >= 0.05 (decision T — frozen at countdown; everything collision derives from it).
+            bool tailOk = cfg.tailRadius >= 0.05f;
+            sb.AppendLine($"[{(tailOk ? "PASS" : "WARN")}] GameConfig.tailRadius >= 0.05 (currently {cfg.tailRadius}; decision T)");
+            if (tailOk) pass++;
+
+            // matchDurationSeconds >= 10 (decision O — timed match; 6 min default).
+            bool durOk = cfg.matchDurationSeconds >= 10f;
+            sb.AppendLine($"[{(durOk ? "PASS" : "WARN")}] GameConfig.matchDurationSeconds >= 10 (currently {cfg.matchDurationSeconds}; decision O)");
+            if (durOk) pass++;
+
+            // gateCollectionRadius >= 0.1 (decision G — trigger radius floor).
+            bool radiusOk = cfg.gateCollectionRadius >= 0.1f;
+            sb.AppendLine($"[{(radiusOk ? "PASS" : "WARN")}] GameConfig.gateCollectionRadius >= 0.1 (currently {cfg.gateCollectionRadius}; decision G)");
+            if (radiusOk) pass++;
+        }
+
+        /// <summary>
+        /// Track B prefab presence under <c>Resources/Gates/</c>. WARN — the
+        /// gate behaviours self-instantiate their visuals at runtime, so the
+        /// game runs without the prefabs, but Track D's MatchManager will need
+        /// them once the spawn pipeline is wired.
+        /// </summary>
+        private static void ValidateLightfieldPrefabs(System.Text.StringBuilder sb, ref int pass)
+        {
+            const string gatesDir = "Assets/Resources/Gates";
+            bool lumenGate = File.Exists($"{gatesDir}/LumenGate.prefab");
+            sb.AppendLine($"[{(lumenGate ? "PASS" : "WARN")}] Resources/Gates/LumenGate.prefab present{(lumenGate ? "" : " (run Light-Runners → Setup → Gate Prefabs)")}");
+            if (lumenGate) pass++;
+
+            bool stolenPickup = File.Exists($"{gatesDir}/StolenLumenPickup.prefab");
+            sb.AppendLine($"[{(stolenPickup ? "PASS" : "WARN")}] Resources/Gates/StolenLumenPickup.prefab present{(stolenPickup ? "" : " (run Light-Runners → Setup → Gate Prefabs)")}");
+            if (stolenPickup) pass++;
+        }
+
+        /// <summary>
+        /// Lightfield + Afterglow assemblies present (Tracks B + F merged). WARN
+        /// — the editor still opens and the scene generator still compiles
+        /// (reflection-driven); a missing assembly just means the relevant
+        /// GameObjects skip silently.
+        /// </summary>
+        private static void ValidateLightfieldAssemblies(System.Text.StringBuilder sb, ref int pass)
+        {
+            bool lightfield = TypeExists("LightRunners.Lightfield.LumenGate");
+            sb.AppendLine($"[{(lightfield ? "PASS" : "WARN")}] LightRunners.Lightfield assembly present (Track B){(lightfield ? "" : " — Lightfield GameObjects skipped on scene gen")}");
+            if (lightfield) pass++;
+
+            bool afterglow = TypeExists("LightRunners.Afterglow.AfterglowViewController");
+            sb.AppendLine($"[{(afterglow ? "PASS" : "WARN")}] LightRunners.Afterglow assembly present (Track F){(afterglow ? "" : " — Afterglow stack skipped on scene gen")}");
+            if (afterglow) pass++;
+
+            bool gameplay = TypeExists("LightRunners.Gameplay.MatchManager");
+            sb.AppendLine($"[{(gameplay ? "PASS" : "WARN")}] LightRunners.Gameplay.MatchManager present (Track D){(gameplay ? "" : " — MatchManager GameObject skipped on scene gen")}");
+            if (gameplay) pass++;
+
+            bool trail = TypeExists("LightRunners.Trail.LumenScoreboard");
+            sb.AppendLine($"[{(trail ? "PASS" : "WARN")}] LightRunners.Trail.LumenScoreboard present (Track A){(trail ? "" : " — Lumen tally falls back to NullLumenScoreboard")}");
+            if (trail) pass++;
+        }
+
+        /// <summary>
+        /// MatchManager present in the Game scene. WARN — generated scenes
+        /// always include it once Track D is merged; a hand-edited scene might
+        /// not. Matches the existing pattern (open the scene, probe by type).
+        /// </summary>
+        private static void ValidateMatchManagerInGameScene(System.Text.StringBuilder sb, ref int pass)
+        {
+            bool present = false;
+            try
+            {
+                for (int i = 0; i < SceneManager.sceneCount; i++)
+                {
+                    var scene = SceneManager.GetSceneAt(i);
+                    if (!scene.isLoaded) continue;
+                    foreach (var root in scene.GetRootGameObjects())
+                    {
+                        // Deep-find by full type name (reflection-free) — works whether
+                        // or not Track D's assembly is referenced at compile time.
+                        var behaviours = root.GetComponentsInChildren<MonoBehaviour>(true);
+                        foreach (var b in behaviours)
+                        {
+                            if (b == null) continue;
+                            if (b.GetType().FullName == "LightRunners.Gameplay.MatchManager")
+                            {
+                                present = true;
+                                break;
+                            }
+                        }
+                        if (present) break;
+                    }
+                    if (present) break;
+                }
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning($"[SetupValidator] MatchManager scene probe failed: {e.Message}");
+            }
+
+            string hint = present ? "" : " (open Game.unity + Light-Runners → Setup → Generate All Scenes)";
+            sb.AppendLine($"[{(present ? "PASS" : "WARN")}] MatchManager present in Game scene{hint}");
+            // WARN-only: only the open scene is probe-able, and most editor runs
+            // don't have Game.unity loaded. We surface the row for awareness.
         }
     }
 }

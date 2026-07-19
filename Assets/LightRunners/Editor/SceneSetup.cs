@@ -298,6 +298,56 @@ namespace LightRunners.Editor
             SetSO(csSO, "flashOverlay", flashImg);
             csSO.ApplyModifiedPropertiesWithoutUndo();
 
+            // ───────────────────────────────────────────────────────────────
+            // Lightfield match core (Track G — active decisions 2026-07-18).
+            //
+            // All additions below are reflection-driven so this generator compiles
+            // whether or not the Lightfield / Afterglow / Multiplayer / Gameplay
+            // tracks are merged at compile time. Pure-C# host authorities
+            // (LightfieldVolume, GateSpawner) are NOT MonoBehaviours — Track D's
+            // MatchManager constructs and registers them at runtime on the
+            // ServiceLocator — so TryAddType gracefully no-ops for them today;
+            // the call sites remain so a future MonoBehaviour conversion wires
+            // automatically. See SPEC §1.5 and the "Lightfield Architecture"
+            // section for the contract map.
+            // ───────────────────────────────────────────────────────────────
+
+            // MatchManager (Track D — decisions E/F/I/O/P/Q/T/U): the match
+            // sub-FSM (Idle→Warmup→Countdown→Live→Scoring→Expired). It wakes
+            // after PlatformServiceRegistry — that GO is created first above,
+            // so Unity's MonoBehaviour Awake order is correct by creation
+            // order; [DefaultExecutionOrder] on MatchManager pins it further.
+            TryAddType("LightRunners.Gameplay.MatchManager", "MatchManager");
+
+            // ViewModeBootstrap (Track D — decision H): forces AR as the
+            // default view on scene load. Lives on its own GO so designers
+            // can disable it without touching GameManager.
+            TryAddType("LightRunners.Gameplay.ViewModeBootstrap", "ViewModeBootstrap");
+
+            // Pure-C# host authorities. NO scene GameObject is needed today —
+            // MatchManager constructs and registers these on the ServiceLocator.
+            // TryAddType is a graceful no-op for non-MonoBehaviour types; the
+            // calls stay so a future conversion wires them automatically.
+            TryAddType("LightRunners.Lightfield.LightfieldVolume", "LightfieldVolume");
+            TryAddType("LightRunners.Lightfield.GateSpawner", "GateSpawner");
+
+            // Afterglow Overview stack (Track F — decisions A/U/T/S).
+            BuildAfterglowStack();
+
+            // MatchHUD canvas (Track D — decisions H/I): TacticalRadar,
+            // OffScreenIndicator, LeaderCrown.
+            BuildMatchHUD();
+
+            // NetworkMatchState (Track C — decisions Q/T): the HOST spawns the
+            // authoritative NetworkObject at match start from
+            // Resources/Player/NetworkMatchState.prefab (see PrefabSetup).
+            // The scene does NOT place a NetworkMatchState GameObject —
+            // spawning from a prefab is the canonical Fusion pattern
+            // (NetworkObjects can only live on a NetworkRunner, not in a
+            // static scene). The host-side MatchManager resolves the prefab
+            // and calls Runner.Spawn. No scene wiring required; this comment
+            // exists for integration readers.
+
             EnsureEventSystem();
 
             EditorSceneManager.SaveScene(scene, GamePath);
@@ -646,6 +696,149 @@ namespace LightRunners.Editor
             SetSO(so, "panel", panel);
             SetSO(so, "acknowledgeButton", ack.GetComponent<Button>());
             so.ApplyModifiedPropertiesWithoutUndo();
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Lightfield match core additions (Track G — active decisions 2026-07-18)
+        //
+        // Every block below uses TryAddType / FindTypeByName so the file
+        // compiles regardless of which tracks/assemblies are present. The
+        // blocks intentionally do NOT throw when a track is missing — they
+        // log and skip, so the scene still generates on a Phase-0 worktree.
+        // ─────────────────────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Track F — Afterglow Overview stack (decisions A, U, T, S).
+        ///
+        /// Adds an "Afterglow" GameObject with an <c>AfterglowViewController</c>
+        /// component (decision U) and a child "OverviewCamera" GameObject that
+        /// carries the <c>OverviewCameraController</c> + an orthographic
+        /// <c>Camera</c>. The controller's <c>[RequireComponent(typeof(Camera))]</c>
+        /// attribute means we add the Camera first; AddComponent on the
+        /// controller then resolves it.
+        ///
+        /// Walk-Inside view is intentionally NOT added (decision S — aerial
+        /// milestone deferred). The controller's walkInsideView slot stays null;
+        /// switching to WalkInside no-ops per the controller's own contract.
+        /// </summary>
+        private static void BuildAfterglowStack()
+        {
+            Type viewControllerType = FindTypeByName("LightRunners.Afterglow.AfterglowViewController");
+            Type overviewCamType = FindTypeByName("LightRunners.Afterglow.OverviewCameraController");
+            if (viewControllerType == null && overviewCamType == null)
+            {
+                Debug.Log("[SceneSetup] Afterglow stack skipped — Track F (LightRunners.Afterglow) not present.");
+                return;
+            }
+
+            try
+            {
+                // Parent GO — survives Across match lifetime; toggled on/off by the controller.
+                var root = new GameObject("Afterglow");
+
+                // Overview camera (Track F: top-down orthographic, frames all captured trails).
+                GameObject overviewView = null;
+                Camera overviewCam = null;
+                if (overviewCamType != null)
+                {
+                    overviewView = new GameObject("OverviewCamera");
+                    overviewView.transform.SetParent(root.transform, false);
+                    overviewCam = overviewView.AddComponent<Camera>();
+                    overviewCam.orthographic = true;
+                    overviewCam.enabled = false; // ViewTransitionManager-equivalent: start hidden.
+                    // RequireComponent(Camera) — adding the behaviour won't create a second camera.
+                    var overviewCtrl = overviewView.AddComponent(overviewCamType);
+                }
+
+                if (viewControllerType != null)
+                {
+                    var controller = root.AddComponent(viewControllerType);
+                    if (controller is Component c)
+                    {
+                        var so = new SerializedObject(c);
+                        SetSO(so, "overviewView", overviewView);
+                        // walkInsideView intentionally null (decision S — deferred).
+                        so.ApplyModifiedPropertiesWithoutUndo();
+                    }
+                }
+                root.SetActive(false); // hidden until IMatchSession raises MatchExpired.
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[SceneSetup] Afterglow stack setup failed: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Track D — Match HUD (decisions H, I): a small canvas above the HUD
+        /// carrying <c>TacticalRadar</c>, <c>OffScreenIndicator</c>, and
+        /// <c>LeaderCrown</c>. All three are decoupled UI widgets that self-wire
+        /// to <see cref="GameEvents"/> + the locator, so the scene generator only
+        /// needs to add the components on a Canvas — the widgets resolve their
+        /// own children/refs from their own <c>Awake</c>/<c>OnEnable</c>.
+        /// </summary>
+        private static void BuildMatchHUD()
+        {
+            try
+            {
+                // Canvas above the existing HUDCanvas (sortingOrder 11) so the
+                // radar / indicators / crown paint on top of the gameplay HUD.
+                var matchCanvas = MakeCanvas("MatchHUD", 1080, 1920, sortingOrder: 11);
+
+                // Full-stretch indicator layer (OffScreenIndicator repositions
+                // arrows along the screen edge each LateUpdate).
+                var indicatorLayer = new GameObject("IndicatorLayer", typeof(RectTransform), typeof(CanvasRenderer));
+                var indicatorRT = indicatorLayer.GetComponent<RectTransform>();
+                indicatorRT.SetParent(matchCanvas.transform, false);
+                Stretch(indicatorRT);
+
+                // TacticalRadar slot (corner). The component builds its own
+                // ring/blip children procedurally, so we just need a RectTransform
+                // root + the component.
+                var radarRoot = new GameObject("TacticalRadar", typeof(RectTransform));
+                var radarRT = radarRoot.GetComponent<RectTransform>();
+                radarRT.SetParent(matchCanvas.transform, false);
+                // Top-right corner of the screen (decision H — corner radar).
+                radarRT.anchorMin = new Vector2(1f, 1f);
+                radarRT.anchorMax = new Vector2(1f, 1f);
+                radarRT.pivot = new Vector2(1f, 1f);
+                radarRT.sizeDelta = new Vector2(280f, 280f);
+                radarRT.anchoredPosition = new Vector2(-40f, -120f);
+
+                // Add the three UI behaviours. TryAddType-style reflection so
+                // the file compiles without Track D's UI assembly present.
+                AddUIComponent(matchCanvas.gameObject, "LightRunners.UI.TacticalRadar");
+                AddUIComponent(matchCanvas.gameObject, "LightRunners.UI.OffScreenIndicator");
+                AddUIComponent(matchCanvas.gameObject, "LightRunners.UI.LeaderCrown");
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[SceneSetup] MatchHUD setup failed: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Reflect-add a MonoBehaviour to a GameObject by full type name.
+        /// Same pattern as <see cref="TryAddType"/> but on an explicit GO
+        /// (the match HUD behaviours must land on the MatchHUD canvas, not
+        /// a freshly-created root).
+        /// </summary>
+        private static void AddUIComponent(GameObject host, string fullTypeName)
+        {
+            try
+            {
+                var type = FindTypeByName(fullTypeName);
+                if (type == null || !type.IsSubclassOf(typeof(MonoBehaviour)))
+                {
+                    Debug.Log($"[SceneSetup] UI component {fullTypeName} skipped — type not found (track not merged yet).");
+                    return;
+                }
+                host.AddComponent(type);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[SceneSetup] Could not add {fullTypeName}: {e.Message}");
+            }
         }
 
         [MenuItem("Light-Runners/Setup/Add Scenes to Build Settings")]
