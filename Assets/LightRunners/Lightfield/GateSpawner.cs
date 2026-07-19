@@ -1,0 +1,339 @@
+using System;
+using System.Collections.Generic;
+using LightRunners.Core;
+using UnityEngine;
+
+namespace LightRunners.Lightfield
+{
+    /// <summary>
+    /// Density formula for the active Lumen Gate pool. Decision M:
+    /// <c>activeGateCount = max(1, ceil(playerCount × gatesPerPlayer))</c>. Default ratio 0.5.
+    /// Pure-C# so the formula is unit-tested in isolation (see GateDensityTests).
+    /// </summary>
+    public static class GateDensity
+    {
+        /// <summary>
+        /// Active gate count for the given player count and ratio. Decision M.
+        /// Always at least 1 (a match with players must have a gate). Negative player counts
+        /// are clamped to 0 before the formula. NaN/negative ratios produce 1 (the floor).
+        /// </summary>
+        public static int ActiveGateCount(int playerCount, float gatesPerPlayer)
+        {
+            if (playerCount <= 0) return 1;
+            if (float.IsNaN(gatesPerPlayer) || gatesPerPlayer <= 0f) return 1;
+
+            double raw = Math.Ceiling(playerCount * (double)gatesPerPlayer);
+            int count = (int)raw;
+            return Math.Max(1, count);
+        }
+    }
+
+    /// <summary>
+    /// Authoritative record of a single Gate spawn (density-pool or bonus). Held in the
+    /// <see cref="GateSpawner"/>'s active dictionary so collection/respawn can address it.
+    /// Decisions G/L/M/R.
+    /// </summary>
+    public sealed class LumenGateState
+    {
+        public GateId Id { get; }
+        public GeoPoint Position { get; }
+        public GatePlacement Placement { get; }
+        /// <summary>
+        /// True for referee-placed bonus gates (decision R). Bonus gates do NOT count toward
+        /// <see cref="GateSpawner.ActiveGateCount"/> and are not replaced on collection.
+        /// </summary>
+        public bool IsBonus { get; }
+
+        public LumenGateState(GateId id, GeoPoint position, GatePlacement placement, bool isBonus)
+        {
+            Id = id;
+            Position = position;
+            Placement = placement;
+            IsBonus = isBonus;
+        }
+
+        public override string ToString() => $"{Id} @ {Position} ({Placement}{(IsBonus ? ", bonus" : "")})";
+    }
+
+    /// <summary>
+    /// Generates a candidate spawn position inside a Lightfield volume. Pulled out as an
+    /// interface so unit tests can inject a fixed sequence (the spawner's respawn loop is
+    /// otherwise non-deterministic). Decision L (ground placement half-buries; milestone is
+    /// always ground).
+    /// </summary>
+    public interface IGatePositionSampler
+    {
+        /// <summary>Return a point inside <paramref name="volume"/> at the volume's ground altitude.</summary>
+        GeoPoint SampleInside(ILightfieldVolume volume);
+    }
+
+    /// <summary>
+    /// Default uniform-area sampler: picks a random point inside the disc of radius
+    /// <c>lightfieldBaseRadiusMeters</c> around the volume origin. Uses sqrt-uniform radius so
+    /// the density is uniform (not clustered at the centre). Spec §4.1 (small-angle projection).
+    ///
+    /// The milestone always returns ground altitude; aerial bands are deferred (decision S,
+    /// decision L). Aerial milestone TODO: pick altitude from active-player bands.
+    /// </summary>
+    public sealed class DefaultGatePositionSampler : IGatePositionSampler
+    {
+        private readonly System.Random _rng;
+        private readonly float _radiusMarginFraction;
+
+        /// <param name="rng">Inject for tests; defaults to a fresh <see cref="System.Random"/>.</param>
+        /// <param name="radiusMarginFraction">
+        /// Sample at this fraction of the configured base radius so Haversine-vs-equirectangular
+        /// error at the rim cannot place a "valid" sample slightly outside. Default 0.9.
+        /// </param>
+        public DefaultGatePositionSampler(System.Random rng = null, float radiusMarginFraction = 0.9f)
+        {
+            _rng = rng ?? new System.Random();
+            _radiusMarginFraction = Mathf.Clamp01(radiusMarginFraction);
+        }
+
+        public GeoPoint SampleInside(ILightfieldVolume volume)
+        {
+            if (volume == null) return default;
+
+            GameConfig cfg = GameConfig.Active;
+            float maxRadius = cfg.lightfieldBaseRadiusMeters * _radiusMarginFraction;
+            GeoPoint origin = volume.Origin;
+
+            // sqrt-uniform so area density is constant over the disc.
+            double r = Math.Sqrt(_rng.NextDouble()) * maxRadius;
+            double theta = _rng.NextDouble() * 2.0 * Math.PI;
+
+            // Equirectangular projection back to lat/lon (consistent with GeoPoint.Haversine).
+            const double EarthR = GeoPoint.EarthRadiusMeters;
+            double metersPerDegLat = Math.PI * EarthR / 180.0;
+            double metersPerDegLon = metersPerDegLat * Math.Cos(origin.latitude * Math.PI / 180.0);
+
+            double dNorth = r * Math.Cos(theta);
+            double dEast = r * Math.Sin(theta);
+
+            return new GeoPoint(
+                origin.latitude + dNorth / metersPerDegLat,
+                origin.longitude + dEast / metersPerDegLon,
+                origin.altitude);  // ground-only milestone; aerial bands deferred (decision S/L).
+        }
+    }
+
+    /// <summary>
+    /// Authoritative Gate spawn/collect lifecycle. Implements <see cref="IGateDirector"/>
+    /// (decisions G, L, M, R). Host-side plain C# — visual instantiation is the consumer's job
+    /// (subscribe to <see cref="GateSpawned"/>/<see cref="GateDespawned"/> and create the
+    /// <see cref="LumenGate"/> GameObjects). Collection is routed back in via
+    /// <see cref="CollectGate"/>; <see cref="HookGameEvents"/> opt-in wires the static bus path
+    /// so a <see cref="LumenGate"/> OnTriggerEnter can raise <c>GameEvents.RaiseGateCollected</c>
+    /// and reach the spawner without a hard reference.
+    /// </summary>
+    public sealed class GateSpawner : IGateDirector
+    {
+        /// <summary>
+        /// Bonus gates are minted above this value so their ids never collide with density-pool
+        /// ids. Density ids start at 1; bonus ids start at <c>BonusGateIdBase</c>. A separate
+        /// reserved range for <c>StolenLumenPickup</c> synthetic ids lives above this.
+        /// </summary>
+        public const int BonusGateIdBase = 1_000_000;
+
+        private readonly ILightfieldVolume _volume;
+        private readonly IGatePositionSampler _sampler;
+        private readonly Dictionary<GateId, LumenGateState> _active = new Dictionary<GateId, LumenGateState>();
+        private int _nextDensityId = 1;
+        private int _nextBonusId = BonusGateIdBase;
+        private bool _hooked;
+
+        public int ActiveGateCount => _active.Count;
+
+        public event Action<GateId, GeoPoint, GatePlacement> GateSpawned;
+        public event Action<GateId> GateDespawned;
+        public event Action<GateId, string> GateCollected;
+
+        /// <param name="volume">The play volume gates must spawn inside.</param>
+        /// <param name="sampler">Spawn position source; null → <see cref="DefaultGatePositionSampler"/>.</param>
+        public GateSpawner(ILightfieldVolume volume, IGatePositionSampler sampler = null)
+        {
+            _volume = volume ?? throw new ArgumentNullException(nameof(volume));
+            _sampler = sampler ?? new DefaultGatePositionSampler();
+        }
+
+        /// <summary>
+        /// Decision M: set the active pool size to
+        /// <c>max(1, ceil(playerCount × gatesPerPlayer))</c> and spawn that many Gates at random
+        /// valid points inside the volume. Clears any prior pool first. Fires
+        /// <see cref="GateSpawned"/> once per spawned gate.
+        /// </summary>
+        public void ConfigureForPlayers(int playerCount, float gatesPerPlayer)
+        {
+            // Clear existing pool (fire despawn so visuals can clean up).
+            if (_active.Count > 0)
+            {
+                foreach (var id in new List<GateId>(_active.Keys))
+                    DespawnGate(id);
+            }
+
+            int target = GateDensity.ActiveGateCount(playerCount, gatesPerPlayer);
+            for (int i = 0; i < target; i++)
+                SpawnDensityGate();
+        }
+
+        /// <summary>
+        /// Decision R — referee-only bonus gate. v2 (full Gate-Director UI) is deferred per
+        /// decision S; the milestone validates only that <paramref name="refereeToken"/> is
+        /// non-empty. Real token validation is <b>Track C's</b> job (<c>RefereeTokenValidator</c>);
+        /// TODO(track-C): wire authoritative referee-token + role check here.
+        ///
+        /// Bonus gates do NOT count toward <see cref="ActiveGateCount"/> and are NOT replaced on
+        /// collection (they're one-shot rewards).
+        /// </summary>
+        public void PlaceBonusGate(GeoPoint at, GatePlacement placement, string refereeToken)
+        {
+            if (string.IsNullOrEmpty(refereeToken))
+            {
+                UnityEngine.Debug.LogWarning("[GateSpawner] PlaceBonusGate rejected: empty referee token. Track C will validate the real token.");
+                return;
+            }
+
+            // Milestone: warn (do not spawn) for aerial requests — decision S/L defers aerial.
+            if (placement == GatePlacement.Aerial)
+            {
+                UnityEngine.Debug.LogWarning("[GateSpawner] PlaceBonusGate: Aerial placement requested but aerial milestone is deferred (decision S/L); forcing Ground for this bonus gate.");
+                placement = GatePlacement.Ground;
+            }
+
+            var id = new GateId(_nextBonusId++);
+            var state = new LumenGateState(id, at, placement, isBonus: true);
+            _active[id] = state;
+
+            GameEvents.RaiseGateSpawned(id.Value, at.latitude, at.longitude, at.altitude, placement);
+            try { GateSpawned?.Invoke(id, at, placement); }
+            catch (Exception ex) { UnityEngine.Debug.LogException(ex); }
+        }
+
+        /// <summary>
+        /// Canonical collection entry point. Removes the gate from the active pool (if present),
+        /// fires <see cref="GateDespawned"/> + <see cref="GateCollected"/>, and — for density
+        /// (non-bonus) gates — respawns ONE new gate elsewhere to preserve the active count
+        /// (decision M). Safe to call with an unknown id (headless host may race); no-op then.
+        /// </summary>
+        public void CollectGate(GateId gateId, string collectorPlayerId)
+        {
+            if (!_active.TryGetValue(gateId, out var state))
+                return;
+
+            bool wasBonus = state.IsBonus;
+            DespawnGate(gateId);
+
+            try { GateCollected?.Invoke(gateId, collectorPlayerId); }
+            catch (Exception ex) { UnityEngine.Debug.LogException(ex); }
+
+            // Decision M: density gates are replaced; bonus gates are one-shot.
+            if (!wasBonus)
+                SpawnDensityGate();
+        }
+
+        /// <summary>Snapshot of currently-active gates (density + bonus). Read-only view.</summary>
+        public IReadOnlyCollection<LumenGateState> ActiveGates => _active.Values;
+
+        /// <summary>Wire the static <see cref="GameEvents.GateCollected"/> bus into CollectGate.</summary>
+        public void HookGameEvents()
+        {
+            if (_hooked) return;
+            GameEvents.GateCollected += OnBusGateCollected;
+            _hooked = true;
+        }
+
+        /// <summary>Disconnect the static bus. Call on match end / Dispose.</summary>
+        public void UnhookGameEvents()
+        {
+            if (!_hooked) return;
+            GameEvents.GateCollected -= OnBusGateCollected;
+            _hooked = false;
+        }
+
+        /// <summary>Tear down: unhook bus + clear pool (no despawn events fired).</summary>
+        public void Dispose()
+        {
+            UnhookGameEvents();
+            _active.Clear();
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Internals
+        // ─────────────────────────────────────────────────────────────────────
+
+        private void OnBusGateCollected(int gateIdValue, string collectorPlayerId)
+        {
+            // Only react to gates we own; ignore StolenLumenPickup synthetic ids (those award
+            // directly) and any unrelated ids.
+            var id = new GateId(gateIdValue);
+            if (_active.ContainsKey(id))
+                CollectGate(id, collectorPlayerId);
+        }
+
+        private void SpawnDensityGate()
+        {
+            GeoPoint at = SampleValidPoint();
+            var id = new GateId(_nextDensityId++);
+            var state = new LumenGateState(id, at, GatePlacement.Ground, isBonus: false);
+            _active[id] = state;
+
+            GameEvents.RaiseGateSpawned(id.Value, at.latitude, at.longitude, at.altitude, GatePlacement.Ground);
+            try { GateSpawned?.Invoke(id, at, GatePlacement.Ground); }
+            catch (Exception ex) { UnityEngine.Debug.LogException(ex); }
+        }
+
+        private void DespawnGate(GateId id)
+        {
+            if (!_active.Remove(id)) return;
+            GameEvents.RaiseGateDespawned(id.Value);
+            try { GateDespawned?.Invoke(id); }
+            catch (Exception ex) { UnityEngine.Debug.LogException(ex); }
+        }
+
+        private GeoPoint SampleValidPoint()
+        {
+            // Try the sampler up to N times; if it keeps returning out-of-bounds points (a buggy
+            // custom sampler), fall back to the origin so we never fail to spawn.
+            const int maxAttempts = 8;
+            for (int i = 0; i < maxAttempts; i++)
+            {
+                GeoPoint p = _sampler.SampleInside(_volume);
+                if (_volume.IsInside(p)) return p;
+            }
+            UnityEngine.Debug.LogWarning("[GateSpawner] Sampler failed to return an in-bounds point after 8 tries; falling back to volume origin.");
+            return _volume.Origin;
+        }
+    }
+
+    /// <summary>
+    /// Forward-declaration of the dropped-Lumen record Track A will produce on crash (decision F).
+    /// Lives here in <c>LightRunners.Lightfield</c> so Track A's review can align on the shape;
+    /// the authoritative queue is owned by Track A's <c>ILumenScoreboard</c> implementation.
+    /// <see cref="StolenLumenPickup"/> reads it (or, for the milestone, observes negative deltas
+    /// on <see cref="GameEvents.LumensChanged"/> as a heuristic). Decisions F, S.
+    /// </summary>
+    public readonly struct StolenLumenRecord
+    {
+        /// <summary>The player whose crash dropped the Lumens.</summary>
+        public readonly string PlayerId;
+        /// <summary>Where the crash happened (pickup spawns here).</summary>
+        public readonly GeoPoint At;
+        /// <summary>Lumens dropped (capped by held score, tier-scaled per decision F).</summary>
+        public readonly int LumensDropped;
+        /// <summary>Match time of the crash, for ordering / expiry.</summary>
+        public readonly double MatchTimeSeconds;
+
+        public StolenLumenRecord(string playerId, GeoPoint at, int lumensDropped, double matchTimeSeconds)
+        {
+            PlayerId = playerId;
+            At = at;
+            LumensDropped = lumensDropped;
+            MatchTimeSeconds = matchTimeSeconds;
+        }
+
+        public bool IsValid => !string.IsNullOrEmpty(PlayerId) && LumensDropped > 0;
+
+        public override string ToString() => $"Stolen[{PlayerId}] -{LumensDropped}L @ {At} t={MatchTimeSeconds:F1}s";
+    }
+}

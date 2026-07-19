@@ -1,0 +1,18 @@
+{
+    "name": "LightRunners.Lightfield",
+    "rootNamespace": "LightRunners.Lightfield",
+    "references": [
+        "Unity.Mathematics",
+        "LightRunners.Core",
+        "LightRunners.Location"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
