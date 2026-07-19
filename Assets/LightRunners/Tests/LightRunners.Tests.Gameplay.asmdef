@@ -1,0 +1,28 @@
+{
+    "name": "LightRunners.Tests.Gameplay",
+    "rootNamespace": "LightRunners.Gameplay.Tests",
+    "references": [
+        "LightRunners.Core",
+        "LightRunners.Gameplay",
+        "LightRunners.Trail",
+        "LightRunners.Location",
+        "LightRunners.UI",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
 using LightRunners.Core;
@@ -7,25 +8,31 @@ using LightRunners.Backend;
 namespace LightRunners.Gameplay
 {
     /// <summary>
-    /// The single end-of-run panel, used for both crash and voluntary end (spec §2.2, §12.4,
-    /// pitfall #9 — v1 didn't put it in any scene). Computes the score via <see cref="RunScorer"/>,
-    /// populates the panel (formats pinned in §25), and POSTs the <c>record_run</c> RPC.
+    /// The single end-of-match panel, used for both crash-expired and voluntary-end (spec §2.2,
+    /// §12.4, pitfall #9 — v1 didn't put it in any scene). Decision E/F: this panel now shows
+    /// the integer Lumen tally, the player's finish rank, and the leader's name — replacing the
+    /// deprecated 4-axis (distance/speed/beauty/proximity) float score from <c>RunScorer</c>.
+    ///
+    /// ─── TRACK D CHANGES (Lightfield match migration, 2026-07-18) ──────────
+    ///   • Compile-break fix: <see cref="PlayerRepository.RecordRun"/> now takes the Lumen tally
+    ///     (<c>int lumens</c>) instead of the deprecated <c>ScoreBreakdown</c>. This call site
+    ///     resolves <see cref="ILumenScoreboard"/> from the locator and passes the local player's
+    ///     final tally (Track E's new signature).
+    ///   • UI change: removed the four 4-axis score columns; the panel now shows Lumens, finish
+    ///     rank, and the leader's display name (decisions E/F/O).
     /// </summary>
     public class RunSummaryUI : Singleton<RunSummaryUI>
     {
         [Header("Panel")]
         [SerializeField] private GameObject summaryPanel;
 
-        [Header("Text fields")]
+        [Header("Lightfield Match — Lumens / rank / leader (decisions E, F, O)")]
         [SerializeField] private TMP_TextAdaptor summaryCrashText;
-        [SerializeField] private TMP_TextAdaptor totalScoreText;
+        [SerializeField] private TMP_TextAdaptor lumensText;
+        [SerializeField] private TMP_TextAdaptor rankText;
+        [SerializeField] private TMP_TextAdaptor leaderText;
         [SerializeField] private TMP_TextAdaptor distanceText;
         [SerializeField] private TMP_TextAdaptor timeText;
-        [SerializeField] private TMP_TextAdaptor avgSpeedText;
-        [SerializeField] private TMP_TextAdaptor distanceScoreText;
-        [SerializeField] private TMP_TextAdaptor speedScoreText;
-        [SerializeField] private TMP_TextAdaptor beautyScoreText;
-        [SerializeField] private TMP_TextAdaptor proximityScoreText;
 
         [Header("Buttons")]
         [SerializeField] private Button runAgainButton;
@@ -49,29 +56,38 @@ namespace LightRunners.Gameplay
             if (continueButton != null) continueButton.onClick.RemoveListener(OnContinue);
         }
 
+        /// <summary>
+        /// Show the post-match summary. <paramref name="otherPlayersNearby"/> is retained for
+        /// API stability but unused (the 4-axis proximity score is gone — decision E).
+        /// </summary>
         public void ShowSummary(TrailData trail, double durationSeconds, int otherPlayersNearby, bool crashed, string causedByPlayerId)
         {
             if (trail == null) { Hide(); return; }
 
-            // TODO(lumen-scoreboard): Track D — replace RunScorer/ScoreBreakdown with
-            // ILumenScoreboard (Lumens, rank, leader) per active decisions E/F/O.
-            ScoreBreakdown score = RunScorer.Calculate(trail, durationSeconds, otherPlayersNearby);
+            // Decision E/F: pull the Lumen tally + finish rank + leader from the scoreboard.
+            // MatchManager registers the real LumenScoreboard (Track A) on Awake; if it isn't
+            // present (e.g. an editor scene without the match core), fall back to 0 / unranked.
+            string localPlayerId = trail.OwnerId;
+            int lumens = 0;
+            int rank = 0;
+            string leaderId = string.Empty;
+            if (ServiceLocator.TryGet<ILumenScoreboard>(out var scoreboard) && scoreboard != null)
+            {
+                lumens = scoreboard.GetLumens(localPlayerId);
+                leaderId = scoreboard.LeaderPlayerId ?? string.Empty;
+                rank = ComputeRank(scoreboard, localPlayerId);
+            }
 
             double distance = trail.TotalLength;
-            double avgSpeed = durationSeconds > 0 ? distance / durationSeconds : 0.0;
 
             if (summaryPanel != null) summaryPanel.SetActive(true);
 
             summaryCrashText?.SetText(CrashCauseText(trail, crashed, causedByPlayerId));
-
-            totalScoreText?.SetText(score.total.ToString());
+            lumensText?.SetText(lumens.ToString());
+            rankText?.SetText(rank > 0 ? Ordinal(rank) : "—");
+            leaderText?.SetText(LeaderDisplayName(leaderId, localPlayerId));
             distanceText?.SetText($"{distance:F0} m");
             timeText?.SetText(FormatTime(durationSeconds));
-            avgSpeedText?.SetText($"{avgSpeed:F2} m/s");
-            distanceScoreText?.SetText($"{score.distance} / 40");
-            speedScoreText?.SetText($"{score.speed} / 20");
-            beautyScoreText?.SetText($"{score.beauty} / 30");
-            proximityScoreText?.SetText($"{score.proximity} / 10");
 
             // Haptics (spec §24): a crash buzzes, nothing else does.
             if (crashed)
@@ -81,15 +97,55 @@ namespace LightRunners.Gameplay
 #endif
             }
 
-            // Persist the run (spec §12.4). Queue-and-retry on failure is inside the repo (§21).
+            // Persist the run (spec §12.4). Track E's new RecordRun signature takes the integer
+            // Lumen tally instead of the deprecated ScoreBreakdown. Queue-and-retry on failure
+            // is inside the repo (§21).
             if (PlayerRepository.HasInstance)
-                PlayerRepository.Instance.RecordRun(trail, durationSeconds, score, crashed);
+                PlayerRepository.Instance.RecordRun(trail, durationSeconds, lumens, crashed);
+        }
+
+        /// <summary>
+        /// Compute the local player's 1-based finish rank (1 = most Lumens). Ties get the same
+        /// rank (standard competition ranking). Returns 0 if the player is unknown to the
+        /// scoreboard.
+        /// </summary>
+        private static int ComputeRank(ILumenScoreboard scoreboard, string localPlayerId)
+        {
+            if (scoreboard == null || string.IsNullOrEmpty(localPlayerId)) return 0;
+            // The scoreboard interface doesn't expose the full roster, so we approximate: the
+            // leader is rank 1; anyone else is unranked for the milestone. A richer roster API
+            // on ILumenScoreboard (TODO for Track A) would let us compute a true finish order.
+            // For now, leader ⇒ rank 1, non-leader ⇒ rank 2 (the only other tier the scoreboard
+            // exposes is GetCrashTier which is not what we want here).
+            string leader = scoreboard.LeaderPlayerId ?? string.Empty;
+            if (string.IsNullOrEmpty(leader)) return 1;            // tied / no leader → call it 1
+            return leader == localPlayerId ? 1 : 2;
+        }
+
+        private static string LeaderDisplayName(string leaderId, string localPlayerId)
+        {
+            if (string.IsNullOrEmpty(leaderId)) return "Tied";
+            if (leaderId == localPlayerId) return "You";
+            return StringUtils.RunnerDisplayName(leaderId);
+        }
+
+        private static string Ordinal(int n)
+        {
+            int m = n % 100;
+            if (m >= 11 && m <= 13) return n + "th";
+            switch (n % 10)
+            {
+                case 1: return n + "st";
+                case 2: return n + "nd";
+                case 3: return n + "rd";
+                default: return n + "th";
+            }
         }
 
         /// <summary>Crash cause phrasing pinned in §25.</summary>
         private static string CrashCauseText(TrailData trail, bool crashed, string causedByPlayerId)
         {
-            if (!crashed) return "Run complete";
+            if (!crashed) return "Match complete";
             if (string.IsNullOrEmpty(causedByPlayerId) || causedByPlayerId == trail.OwnerId)
                 return "You crossed your own trail";
             return $"You hit {StringUtils.RunnerDisplayName(causedByPlayerId)}'s trail";

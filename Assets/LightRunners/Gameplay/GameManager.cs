@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using UnityEngine;
 using LightRunners.Core;
 using LightRunners.Location;
@@ -18,6 +19,24 @@ namespace LightRunners.Gameplay
     /// even when Fusion fails to connect. On collision it raises the same
     /// <see cref="GameEvents.RaisePlayerCrashed"/> so the crash pipeline is identical
     /// regardless of network state.
+    ///
+    /// ─── TRACK D CHANGES (Lightfield match migration, 2026-07-18) ──────────
+    /// The match lifecycle has been delegated to <see cref="MatchManager"/> (decision P).
+    /// Specifically:
+    ///   • <see cref="StartRun"/> additionally calls <see cref="MatchManager.BeginMatch"/> so
+    ///     the match sub-FSM (Idle→Warmup→Countdown→Live) runs in lockstep with this app-level
+    ///     Running state. The match lives ON TOP of <see cref="GameState"/>, not in place of it.
+    ///   • Direct <c>FusionLauncher.Connect/Disconnect</c> calls are replaced by
+    ///     <c>IMatchTransport</c> resolved from the <see cref="ServiceLocator"/> (decision Q).
+    ///     Track C's real <c>FusionLauncher</c> overwrites the locator slot when the runner
+    ///     comes up; in editor-only mode the <c>NullMatchTransport</c> is used (no-op).
+    ///   • Crash is no longer terminal (decision F): <see cref="OnPlayerCrashed"/> delegates to
+    ///     <see cref="MatchManager.HandlePlayerCrash"/> (penalty + respawn) instead of
+    ///     <see cref="FinalizeRun"/>. <see cref="FinalizeRun"/> is retained for voluntary
+    ///     end-of-match (<see cref="EndRun"/>) and app-lifecycle grace expiry.
+    ///   • <see cref="OnPositionUpdate"/> consults <see cref="SnakeTailModel"/> from
+    ///     <see cref="MatchManager"/> after each local-trail append (Track A's snake-tail rule,
+    ///     decision B).
     /// </summary>
     public class GameManager : Singleton<GameManager>
     {
@@ -91,6 +110,8 @@ namespace LightRunners.Gameplay
             GameEvents.PlayerCrashed += OnPlayerCrashed;
             GameEvents.ConnectionStateChanged += OnConnectionStateChanged;
             if (fallbackDetector != null) fallbackDetector.OnCollisionDetected += OnFallbackCollision;
+            if (MatchManager.HasInstance)
+                MatchManager.Instance.RespawnRequested += OnRespawnRequested;
         }
 
         protected virtual void OnDisable()
@@ -98,6 +119,8 @@ namespace LightRunners.Gameplay
             GameEvents.PlayerCrashed -= OnPlayerCrashed;
             GameEvents.ConnectionStateChanged -= OnConnectionStateChanged;
             if (fallbackDetector != null) fallbackDetector.OnCollisionDetected -= OnFallbackCollision;
+            if (MatchManager.HasInstance)
+                MatchManager.Instance.RespawnRequested -= OnRespawnRequested;
         }
 
         protected virtual void Start()
@@ -280,30 +303,47 @@ namespace LightRunners.Gameplay
                     : default);
             }
 
-#if FUSION_WEAVER
-            // Async connect window: race Connect against connectTimeoutSeconds, then run
-            // either way (spec §8.1 — never block Start Run on the network).
-            if (Multiplayer.FusionLauncher.HasInstance)
+            // Decision Q: connect through the locator-resolved IMatchTransport instead of
+            // reaching into the Multiplayer assembly directly. The concrete FusionLauncher
+            // (Track C) overwrites the locator slot when the runner comes up; in editor-only
+            // mode the NullMatchTransport is a no-op and we proceed solo immediately.
+            if (ServiceLocator.TryGet<IMatchTransport>(out var transport) && transport != null)
             {
                 if (_connectRoutine != null) StopCoroutine(_connectRoutine);
-                _connectRoutine = StartCoroutine(CoConnectThenRun());
+                _connectRoutine = StartCoroutine(CoConnectThenRun(transport));
                 return;
             }
-#endif
             BeginRunning();
         }
 
-#if FUSION_WEAVER
-        private IEnumerator CoConnectThenRun()
+        /// <summary>
+        /// Async connect window: race ConnectMatch against connectTimeoutSeconds, then run
+        /// either way (spec §8.1 — never block Start Run on the network). Observes
+        /// <see cref="GameEvents.ConnectionStateChanged"/> for completion rather than a
+        /// transport-specific callback.
+        /// </summary>
+        private IEnumerator CoConnectThenRun(IMatchTransport transport)
         {
             string room = ResolveRoomName();
-            var launcher = Multiplayer.FusionLauncher.Instance;
             bool done = false;
-            launcher.Connect(room, LocalPlayerId, ok => { done = true; });
+            Action<bool> onConn = _ => done = true;
+            GameEvents.ConnectionStateChanged += onConn;
+
+            try
+            {
+                transport.ConnectMatch(room, LocalPlayerId);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[GameManager] IMatchTransport.ConnectMatch threw: {e.Message}");
+                done = true;
+            }
 
             float deadline = Time.realtimeSinceStartup + GameConfig.Active.connectTimeoutSeconds;
             while (!done && Time.realtimeSinceStartup < deadline)
                 yield return null;
+
+            GameEvents.ConnectionStateChanged -= onConn;
 
             // OnlineRace is set by the ConnectionStateChanged event; on timeout it stays null
             // and the run proceeds solo with the §8.4 fallback detector.
@@ -311,7 +351,6 @@ namespace LightRunners.Gameplay
             _connectRoutine = null;
             BeginRunning();
         }
-#endif
 
         private void BeginRunning()
         {
@@ -321,6 +360,11 @@ namespace LightRunners.Gameplay
                 _trailRepository.BeginRun(TrailManager.Instance.LocalTrail, ResolveRoomName());
 
             SetState(GameState.Running);
+
+            // Decision P: start the match sub-FSM. MatchManager owns the Lightfield match
+            // lifecycle (Warmup/Countdown/Live/Scoring/Expired) on top of this GameState.
+            if (MatchManager.HasInstance)
+                MatchManager.Instance.BeginMatch();
         }
 
         /// <summary>
@@ -345,10 +389,23 @@ namespace LightRunners.Gameplay
             return StringUtils.FormatInvariant("zone_{0:0.0}_{1:0.0}", latCell, lonCell);
         }
 
-        /// <summary>Voluntarily end the run (End Run button, visible only in Running).</summary>
+        /// <summary>
+        /// Voluntarily end the run (End Run button, visible only in Running). In match mode
+        /// (decision P), this delegates to <see cref="MatchManager.EndMatch"/> which drives
+        /// the match through Scoring→Expired and shows the Afterglow / summary. For a non-match
+        /// solo run (no MatchManager) we fall back to <see cref="FinalizeRun"/>.
+        /// </summary>
         public void EndRun()
         {
             if (State != GameState.Running) return;
+
+            if (MatchManager.HasInstance && MatchManager.Instance.State != MatchState.Idle
+                && MatchManager.Instance.State != MatchState.Expired)
+            {
+                MatchManager.Instance.EndMatch();
+                FinalizeRun(crashed: false, causedBy: null);
+                return;
+            }
             FinalizeRun(crashed: false, causedBy: null);
         }
 
@@ -410,6 +467,19 @@ namespace LightRunners.Gameplay
             if (TrailManager.HasInstance)
             {
                 TrailManager.Instance.OnLocationUpdate(pos);
+
+                // Decision B (snake-tail energy budget): after appending, consult the
+                // MatchManager's SnakeTailModel and prune the local trail to its cap when
+                // exceeded. TrailData.PruneTo preserves the TotalLength accumulator (pitfall #18),
+                // so distance scoring stays correct even as the tail dissolves.
+                if (MatchManager.HasInstance && MatchManager.Instance.SnakeTailModel != null)
+                {
+                    var lt2 = TrailManager.Instance.LocalTrail;
+                    var model = MatchManager.Instance.SnakeTailModel;
+                    if (lt2 != null && model.ShouldPruneOldest(lt2.PointCount))
+                        lt2.PruneTo(model.MaxSegments);
+                }
+
                 // TEMP DIAGNOSTIC: once per second, confirm trail grew.
                 if (Time.unscaledTime - _lastStateLog > 1f)
                 {
@@ -454,12 +524,55 @@ namespace LightRunners.Gameplay
 
         private void OnPlayerCrashed(string causedByPlayerId)
         {
-            // Double-fire guard: both Fusion and the fallback can fire.
+            // Double-fire guard: both Fusion and the fallback can fire (spec §16).
             if (State != GameState.Running) return;
             if (_crashPipelineFired) return;
             _crashPipelineFired = true;
 
+            // Decision F: crash is no longer terminal in match mode. Delegate the penalty +
+            // respawn to MatchManager, which applies the Lumen penalty, records full metadata
+            // to the replay sink (closes Track F's crash-metadata gap), and fires
+            // RespawnRequested. We reset the guard so a subsequent crash (after respawn grace)
+            // is handled again.
+            if (MatchManager.HasInstance && MatchManager.Instance.State == MatchState.Live)
+            {
+                GeoPoint at = LocationProvider.HasInstance
+                    ? LocationProvider.Instance.CurrentPosition
+                    : default;
+                MatchManager.Instance.HandlePlayerCrash(
+                    !string.IsNullOrEmpty(causedByPlayerId) ? causedByPlayerId : LocalPlayerId, at);
+                _crashPipelineFired = false; // allow the next crash event through (post-respawn)
+                return;
+            }
+
+            // Non-match (solo) path: crash still terminates the run.
             FinalizeRun(crashed: true, causedBy: causedByPlayerId);
+        }
+
+        /// <summary>
+        /// Respawn hook (decision F). MatchManager fires this after applying the Lumen penalty +
+        /// recording the crash metadata. We:
+        ///   • mark a trail discontinuity so the post-crash movement doesn't bridge a phantom wall
+        ///     across the crash site (spec §20),
+        ///   • reset the fallback collision detector at the respawn point so the in-flight
+        ///     movement segment can't instantly re-crash into the same trail,
+        ///   • reset the crash-pipeline guard so the next crash event is handled normally,
+        ///   • (TODO) teleport the avatar to the respawn offset — left to the avatar controller
+        ///     in the integration phase; for the milestone the runner simply resumes from the
+        ///     current GPS position.
+        /// </summary>
+        private void OnRespawnRequested(string playerId, GeoPoint crashSite)
+        {
+            if (TrailManager.HasInstance)
+                TrailManager.Instance.MarkDiscontinuity();
+
+            if (fallbackDetector != null)
+                fallbackDetector.BeginRun(crashSite);
+
+            _crashPipelineFired = false;
+            _haveLastPos = false;
+
+            Debug.Log($"[GameManager] Runner respawned after crash (playerId={playerId}, crash={crashSite}).");
         }
 
         private void FinalizeRun(bool crashed, string causedBy)
@@ -491,11 +604,12 @@ namespace LightRunners.Gameplay
             // Tear down fallback collision for this run.
             if (fallbackDetector != null) fallbackDetector.EndRun();
 
-#if FUSION_WEAVER
+            // Decision Q: disconnect through the locator-resolved IMatchTransport. The concrete
+            // FusionLauncher (Track C) registers itself as the transport when it comes up; in
+            // editor-only mode the NullMatchTransport is a no-op.
             if (_connectRoutine != null) { StopCoroutine(_connectRoutine); _connectRoutine = null; }
-            if (Multiplayer.FusionLauncher.HasInstance)
-                Multiplayer.FusionLauncher.Instance.Disconnect();
-#endif
+            if (ServiceLocator.TryGet<IMatchTransport>(out var transport) && transport != null)
+                transport.Disconnect();
             OnlineRace = null;
 
             SetState(crashed ? GameState.Crashed : GameState.Lobby);
