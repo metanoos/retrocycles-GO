@@ -30,6 +30,7 @@ namespace LightRunners.Gameplay
 
             RegisterAuth();
             RegisterAltitude();
+            RegisterNullMatchServices();
         }
 
         private void RegisterAuth()
@@ -60,6 +61,35 @@ namespace LightRunners.Gameplay
             {
                 ServiceLocator.Register(provider.AltitudeService);
             }
+        }
+
+        /// <summary>
+        /// Register Null* Lightfield match services so editor-only playmode compiles and
+        /// runs end-to-end before the real impls land on their parallel tracks:
+        ///   - LumenScoreboard        → LightRunners.Trail       (Track A)
+        ///   - GateSpawner / Volume   → LightRunners.Lightfield  (Track B)
+        ///   - FusionLauncher         → LightRunners.Multiplayer (Track C, FUSION_WEAVER)
+        ///   - MatchManager           → LightRunners.Gameplay    (Track D)
+        ///   - ReplayPackage sink     → LightRunners.Afterglow   (Track F)
+        /// Each real impl overwrites its slot via ServiceLocator.Register when it comes up
+        /// (Register replaces; TryRegister would wrongly keep the null).
+        /// </summary>
+        private void RegisterNullMatchServices()
+        {
+            if (!ServiceLocator.IsRegistered<IMatchSession>())
+                ServiceLocator.Register<IMatchSession>(new NullMatchSession());
+            if (!ServiceLocator.IsRegistered<ILumenScoreboard>())
+                ServiceLocator.Register<ILumenScoreboard>(new NullLumenScoreboard());
+            if (!ServiceLocator.IsRegistered<IGateDirector>())
+                ServiceLocator.Register<IGateDirector>(new NullGateDirector());
+            if (!ServiceLocator.IsRegistered<ILightfieldVolume>())
+                ServiceLocator.Register<ILightfieldVolume>(new NullLightfieldVolume());
+            if (!ServiceLocator.IsRegistered<IMatchTransport>())
+                ServiceLocator.Register<IMatchTransport>(new NullMatchTransport());
+            if (!ServiceLocator.IsRegistered<IMatchReplaySink>())
+                ServiceLocator.Register<IMatchReplaySink>(new NullMatchReplaySink());
+            if (!ServiceLocator.IsRegistered<ITailAuthority>())
+                ServiceLocator.Register<ITailAuthority>(new NullTailAuthority());
         }
 
         private void OnDestroy()

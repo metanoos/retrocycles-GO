@@ -66,7 +66,11 @@ namespace LightRunners.Backend
                 onError: err => Debug.LogWarning($"[PlayerRepository] get failed: {err}"));
         }
 
-        /// <summary>Persist a finished run (spec §12.4). Fire-and-forget with offline queueing.</summary>
+        /// <summary>
+        /// Persist a finished run (spec §12.4). Fire-and-forget with offline queueing.
+        /// TODO(lumen-scoreboard): Track E — replace ScoreBreakdown persistence with the
+        /// Lumen model (matches/match_players tables, record_match_result RPC). Decision E.
+        /// </summary>
         public void RecordRun(TrailData trail, double durationSeconds, ScoreBreakdown score, bool crashed)
         {
             var sb = Supabase;

@@ -53,6 +53,8 @@ namespace LightRunners.Gameplay
         {
             if (trail == null) { Hide(); return; }
 
+            // TODO(lumen-scoreboard): Track D — replace RunScorer/ScoreBreakdown with
+            // ILumenScoreboard (Lumens, rank, leader) per active decisions E/F/O.
             ScoreBreakdown score = RunScorer.Calculate(trail, durationSeconds, otherPlayersNearby);
 
             double distance = trail.TotalLength;

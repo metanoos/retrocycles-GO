@@ -34,6 +34,35 @@ namespace LightRunners.Core
         /// </summary>
         public static event Action<int> PlayerLevelChanged;
 
+        // ─── Lightfield Match events (active decisions 2026-07-18) ───────────
+        // Raised by MatchManager (Gameplay) and its subsystems. Mirrors the
+        // existing bus pattern: lets Multiplayer/AR/UI/Backend react to match
+        // transitions without referencing Gameplay (which would be a cycle).
+
+        /// <summary>Match sub-state transition (decision P). (previous, next).</summary>
+        public static event Action<MatchState, MatchState> MatchStateChanged;
+
+        /// <summary>Lumen tally changed (decision E). (playerId, newTotal).</summary>
+        public static event Action<string, int> LumensChanged;
+
+        /// <summary>Leader changed (decisions F, I). newLeaderId is empty string on tie/null.</summary>
+        public static event Action<string> LeaderChanged;
+
+        /// <summary>A runner collected a Lumen Gate (decisions C, E, G). (gateId.Value, collectorPlayerId).</summary>
+        public static event Action<int, string> GateCollected;
+
+        /// <summary>A Gate spawned (decision G/L/M). (gateId.Value, lat, lon, alt, placement).</summary>
+        public static event Action<int, double, double, double, GatePlacement> GateSpawned;
+
+        /// <summary>A Gate despawned (collected/expired). (gateId.Value).</summary>
+        public static event Action<int> GateDespawned;
+
+        /// <summary>A runner crossed the Lightfield boundary (decision K). playerId.</summary>
+        public static event Action<string> BoundaryViolated;
+
+        /// <summary>The live clock reached zero (decision O). Most Lumens wins.</summary>
+        public static event Action MatchExpired;
+
         public static void RaisePlayerLevelChanged(int level)
             => PlayerLevelChanged?.Invoke(level);
 
@@ -48,6 +77,32 @@ namespace LightRunners.Core
 
         public static void RaiseConnectionStateChanged(bool online)
             => ConnectionStateChanged?.Invoke(online);
+
+        // ─── Lightfield Match event raisers ──────────────────────────────────
+
+        public static void RaiseMatchStateChanged(MatchState previous, MatchState next)
+            => MatchStateChanged?.Invoke(previous, next);
+
+        public static void RaiseLumensChanged(string playerId, int newTotal)
+            => LumensChanged?.Invoke(playerId, newTotal);
+
+        public static void RaiseLeaderChanged(string leaderId)
+            => LeaderChanged?.Invoke(leaderId);
+
+        public static void RaiseGateCollected(int gateIdValue, string collectorPlayerId)
+            => GateCollected?.Invoke(gateIdValue, collectorPlayerId);
+
+        public static void RaiseGateSpawned(int gateIdValue, double lat, double lon, double alt, GatePlacement placement)
+            => GateSpawned?.Invoke(gateIdValue, lat, lon, alt, placement);
+
+        public static void RaiseGateDespawned(int gateIdValue)
+            => GateDespawned?.Invoke(gateIdValue);
+
+        public static void RaiseBoundaryViolated(string playerId)
+            => BoundaryViolated?.Invoke(playerId);
+
+        public static void RaiseMatchExpired()
+            => MatchExpired?.Invoke();
 
         // Intentionally not providing an Unsubscribe-all: subscribers must manage their own
         // lifetimes to avoid silent leaks across scene loads.
