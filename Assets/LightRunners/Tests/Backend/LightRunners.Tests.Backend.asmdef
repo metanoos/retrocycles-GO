@@ -1,0 +1,27 @@
+{
+    "name": "LightRunners.Tests.Backend",
+    "rootNamespace": "LightRunners.Tests.Backend",
+    "references": [
+        "LightRunners.Core",
+        "LightRunners.Backend",
+        "LightRunners.Trail",
+        "LightRunners.Location",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
