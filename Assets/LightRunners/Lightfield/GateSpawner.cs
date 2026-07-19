@@ -306,34 +306,7 @@ namespace LightRunners.Lightfield
         }
     }
 
-    /// <summary>
-    /// Forward-declaration of the dropped-Lumen record Track A will produce on crash (decision F).
-    /// Lives here in <c>LightRunners.Lightfield</c> so Track A's review can align on the shape;
-    /// the authoritative queue is owned by Track A's <c>ILumenScoreboard</c> implementation.
-    /// <see cref="StolenLumenPickup"/> reads it (or, for the milestone, observes negative deltas
-    /// on <see cref="GameEvents.LumensChanged"/> as a heuristic). Decisions F, S.
-    /// </summary>
-    public readonly struct StolenLumenRecord
-    {
-        /// <summary>The player whose crash dropped the Lumens.</summary>
-        public readonly string PlayerId;
-        /// <summary>Where the crash happened (pickup spawns here).</summary>
-        public readonly GeoPoint At;
-        /// <summary>Lumens dropped (capped by held score, tier-scaled per decision F).</summary>
-        public readonly int LumensDropped;
-        /// <summary>Match time of the crash, for ordering / expiry.</summary>
-        public readonly double MatchTimeSeconds;
-
-        public StolenLumenRecord(string playerId, GeoPoint at, int lumensDropped, double matchTimeSeconds)
-        {
-            PlayerId = playerId;
-            At = at;
-            LumensDropped = lumensDropped;
-            MatchTimeSeconds = matchTimeSeconds;
-        }
-
-        public bool IsValid => !string.IsNullOrEmpty(PlayerId) && LumensDropped > 0;
-
-        public override string ToString() => $"Stolen[{PlayerId}] -{LumensDropped}L @ {At} t={MatchTimeSeconds:F1}s";
-    }
+    // StolenLumenRecord lives in LightRunners.Core (Core/MatchContracts.cs) — shared by
+    // Trail (authoritative queue owner) and Lightfield (consumer). Reconciled during
+    // integration; Track B's forward-declaration duplicate removed.
 }

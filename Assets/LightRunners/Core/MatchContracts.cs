@@ -30,6 +30,62 @@ namespace LightRunners.Core
     }
 
     /// <summary>
+    /// A Lumen dropped on crash and briefly stealable. Decision F: dropped Lumens become
+    /// pickups at the crash site for <c>GameConfig.stolenLumenPickupSeconds</c> seconds;
+    /// the authoritative queue is owned by <c>LightRunners.Trail.LumenScoreboard</c>
+    /// (Track A) and drained by <c>LightRunners.Lightfield.StolenLumenPickup</c> (Track B).
+    ///
+    /// Lives in Core (not Trail or Lightfield) so both assemblies can share one canonical
+    /// shape without a Trail↔Lightfield reference cycle. Reconciliation of the duplicate
+    /// declarations Tracks A and B originally shipped during parallel dev.
+    /// </summary>
+    [Serializable]
+    public readonly struct StolenLumenRecord : IEquatable<StolenLumenRecord>
+    {
+        /// <summary>The player whose crash dropped the Lumens.</summary>
+        public readonly string PlayerId;
+        /// <summary>Where the crash happened (pickup spawns here).</summary>
+        public readonly GeoPoint At;
+        /// <summary>Lumens dropped (capped by held score, tier-scaled per decision F). Always &gt; 0 for a real record.</summary>
+        public readonly int LumensDropped;
+        /// <summary>Match time of the crash, for ordering / expiry.</summary>
+        public readonly double MatchTimeSeconds;
+        /// <summary>Lifetime (s). Cached from <c>GameConfig.stolenLumenPickupSeconds</c> at drop time so a later config tweak doesn't change pickups already in flight.</summary>
+        public readonly float LifetimeSeconds;
+
+        public StolenLumenRecord(string playerId, GeoPoint at, int lumensDropped, double matchTimeSeconds, float lifetimeSeconds)
+        {
+            PlayerId = playerId;
+            At = at;
+            LumensDropped = lumensDropped;
+            MatchTimeSeconds = matchTimeSeconds;
+            LifetimeSeconds = lifetimeSeconds;
+        }
+
+        /// <summary>Expiry match time = <see cref="MatchTimeSeconds"/> + <see cref="LifetimeSeconds"/>.</summary>
+        public double ExpiresAtSeconds => MatchTimeSeconds + LifetimeSeconds;
+
+        /// <summary>True when populated with a real drop. Empty/null records are invalid.</summary>
+        public bool IsValid => !string.IsNullOrEmpty(PlayerId) && LumensDropped > 0;
+
+        public bool Equals(StolenLumenRecord other)
+            => PlayerId == other.PlayerId
+               && At.Equals(other.At)
+               && LumensDropped == other.LumensDropped
+               && MatchTimeSeconds.Equals(other.MatchTimeSeconds)
+               && LifetimeSeconds.Equals(other.LifetimeSeconds);
+
+        public override bool Equals(object obj) => obj is StolenLumenRecord r && Equals(r);
+        public override int GetHashCode()
+            => (PlayerId, At, LumensDropped, MatchTimeSeconds, LifetimeSeconds).GetHashCode();
+        public static bool operator ==(StolenLumenRecord a, StolenLumenRecord b) => a.Equals(b);
+        public static bool operator !=(StolenLumenRecord a, StolenLumenRecord b) => !a.Equals(b);
+
+        public override string ToString()
+            => $"Stolen[{PlayerId}] -{LumensDropped}L @ {At} t={MatchTimeSeconds:F1}s life={LifetimeSeconds:F1}s";
+    }
+
+    /// <summary>
     /// Match FSM front (decision P — new Lightfield match core). Implemented by
     /// MatchManager (Gameplay) on top of the existing GameState. The match is a
     /// strictly layered sub-FSM: <see cref="MatchState.Idle"/> whenever no match

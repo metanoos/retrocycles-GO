@@ -4,64 +4,9 @@ using LightRunners.Core;
 
 namespace LightRunners.Trail
 {
-    /// <summary>
-    /// A Lumen dropped on crash and briefly stealable. Decision F: dropped Lumens
-    /// become pickups at the crash site for <see cref="GameConfig.stolenLumenPickupSeconds"/>
-    /// seconds; the gameplay layer (Track B's <c>StolenLumenPickup</c>) drains the queue and
-    /// renders + collects them.
-    ///
-    /// Track A owns the authoritative queue (see <see cref="LumenScoreboard"/>). This struct's
-    /// shape mirrors the consumer-side record declared in
-    /// <c>LightRunners.Lightfield.StolenLumenRecord</c> (PlayerId / At / LumensDropped /
-    /// MatchTimeSeconds) plus the consumer-readable expiry fields, so Track B can adapt with a
-    /// trivial conversion (or, in the integration phase, both can be unified into Core).
-    /// Cross-track coordination note: see the report at the end of Track A's branch.
-    /// </summary>
-    [Serializable]
-    public readonly struct StolenLumenRecord : IEquatable<StolenLumenRecord>
-    {
-        /// <summary>The player whose crash dropped the Lumens.</summary>
-        public readonly string PlayerId;
-        /// <summary>Where the crash happened (pickup spawns here).</summary>
-        public readonly GeoPoint At;
-        /// <summary>Lumens dropped (capped by held score, tier-scaled per decision F). Always &gt; 0 for a real record.</summary>
-        public readonly int LumensDropped;
-        /// <summary>Match time of the crash, for ordering / expiry.</summary>
-        public readonly double MatchTimeSeconds;
-        /// <summary>Lifetime (s). Cached from <see cref="GameConfig.stolenLumenPickupSeconds"/> at drop time so a later config tweak doesn't change pickups already in flight.</summary>
-        public readonly float LifetimeSeconds;
-
-        public StolenLumenRecord(string playerId, GeoPoint at, int lumensDropped, double matchTimeSeconds, float lifetimeSeconds)
-        {
-            PlayerId = playerId;
-            At = at;
-            LumensDropped = lumensDropped;
-            MatchTimeSeconds = matchTimeSeconds;
-            LifetimeSeconds = lifetimeSeconds;
-        }
-
-        /// <summary>Expiry match time = <see cref="MatchTimeSeconds"/> + <see cref="LifetimeSeconds"/>.</summary>
-        public double ExpiresAtSeconds => MatchTimeSeconds + LifetimeSeconds;
-
-        /// <summary>True when populated with a real drop. Empty/null records are invalid.</summary>
-        public bool IsValid => !string.IsNullOrEmpty(PlayerId) && LumensDropped > 0;
-
-        public bool Equals(StolenLumenRecord other)
-            => PlayerId == other.PlayerId
-               && At.Equals(other.At)
-               && LumensDropped == other.LumensDropped
-               && MatchTimeSeconds.Equals(other.MatchTimeSeconds)
-               && LifetimeSeconds.Equals(other.LifetimeSeconds);
-
-        public override bool Equals(object obj) => obj is StolenLumenRecord r && Equals(r);
-        public override int GetHashCode()
-            => (PlayerId, At, LumensDropped, MatchTimeSeconds, LifetimeSeconds).GetHashCode();
-        public static bool operator ==(StolenLumenRecord a, StolenLumenRecord b) => a.Equals(b);
-        public static bool operator !=(StolenLumenRecord a, StolenLumenRecord b) => !a.Equals(b);
-
-        public override string ToString()
-            => $"Stolen[{PlayerId}] -{LumensDropped}L @ {At} t={MatchTimeSeconds:F1}s life={LifetimeSeconds:F1}s";
-    }
+    // StolenLumenRecord lives in LightRunners.Core (Core/MatchContracts.cs) so both Trail
+    // and Lightfield can share one canonical shape without a Trail↔Lightfield reference.
+    // Reconciled during integration — originally Track A and Track B each declared a copy.
 
     /// <summary>
     /// Authoritative integer Lumen tally for a match (decisions E, F, I). Implements
