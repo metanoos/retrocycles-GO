@@ -805,14 +805,43 @@ begin
         raise exception 'not_found';
     end if;
 
-    -- Host can write any player's row; a player may write their own.
-    if p_player_id <> v_caller_uid and not exists (
-        select 1 from public.match_players h
-        where h.match_id = p_match_id
-          and h.player_id = v_caller_uid
-          and h.role = 'host')
-    then
+    -- Determine whether the caller is already an established host of THIS match.
+    -- (Round-1 review fix R1-F5: the prior check gated the host-privilege path only when
+    -- p_player_id <> v_caller_uid, which let a runner self-write role='host' and then issue
+    -- further calls as host — a privilege-escalation chain. The role-lock below is independent
+    -- of self-vs-other and closes the hole: only an EXISTING host may write host/referee roles.)
+    declare
+        v_caller_is_host boolean;
+    begin
+        select exists (
+            select 1 from public.match_players h
+            where h.match_id = p_match_id
+              and h.player_id = v_caller_uid
+              and h.role = 'host'
+        ) into v_caller_is_host;
+    end;
+
+    -- A non-host may never assign host or referee roles (to anyone, including themselves).
+    -- They may only record a 'runner' row.
+    if p_role in ('host','referee') and not coalesce(v_caller_is_host, false) then
         raise exception 'not_host';
+    end if;
+
+    -- Host can write any player's row; a player may write their own (runner) row.
+    if p_player_id <> v_caller_uid and not coalesce(v_caller_is_host, false) then
+        raise exception 'not_host';
+    end if;
+
+    -- Defense-in-depth: if the row already exists with role='host' for a different player,
+    -- refuse to overwrite it (prevents a host from demoting a co-host to steal host status, and
+    -- prevents a late-arriving self-escalation from replacing the real host's row).
+    if p_role = 'host' and exists (
+        select 1 from public.match_players existing
+        where existing.match_id = p_match_id
+          and existing.player_id <> p_player_id
+          and existing.role = 'host')
+    then
+        raise exception 'host_already_exists';
     end if;
 
     insert into public.match_players (match_id, player_id, lumens, finish_rank, role)

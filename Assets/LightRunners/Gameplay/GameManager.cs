@@ -109,6 +109,7 @@ namespace LightRunners.Gameplay
         {
             GameEvents.PlayerCrashed += OnPlayerCrashed;
             GameEvents.ConnectionStateChanged += OnConnectionStateChanged;
+            GameEvents.MatchExpired += OnMatchExpired;
             if (fallbackDetector != null) fallbackDetector.OnCollisionDetected += OnFallbackCollision;
             if (MatchManager.HasInstance)
                 MatchManager.Instance.RespawnRequested += OnRespawnRequested;
@@ -118,6 +119,7 @@ namespace LightRunners.Gameplay
         {
             GameEvents.PlayerCrashed -= OnPlayerCrashed;
             GameEvents.ConnectionStateChanged -= OnConnectionStateChanged;
+            GameEvents.MatchExpired -= OnMatchExpired;
             if (fallbackDetector != null) fallbackDetector.OnCollisionDetected -= OnFallbackCollision;
             if (MatchManager.HasInstance)
                 MatchManager.Instance.RespawnRequested -= OnRespawnRequested;
@@ -329,27 +331,37 @@ namespace LightRunners.Gameplay
             Action<bool> onConn = _ => done = true;
             GameEvents.ConnectionStateChanged += onConn;
 
+            // Round-1 review fix R1-F8: the prior -= was OUTSIDE any finally, so an early
+            // StopCoroutine (from RequestStartRun's branch above or OnDestroy) halted the
+            // coroutine mid-yield and leaked the delegate on the static bus — stale delegates
+            // then fired on later connection-state changes, calling into disposed state. Wrap
+            // the whole body in try/finally so the unsubscribe always runs.
             try
             {
-                transport.ConnectMatch(room, LocalPlayerId);
+                try
+                {
+                    transport.ConnectMatch(room, LocalPlayerId);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning($"[GameManager] IMatchTransport.ConnectMatch threw: {e.Message}");
+                    done = true;
+                }
+
+                float deadline = Time.realtimeSinceStartup + GameConfig.Active.connectTimeoutSeconds;
+                while (!done && Time.realtimeSinceStartup < deadline)
+                    yield return null;
+
+                // OnlineRace is set by the ConnectionStateChanged event; on timeout it stays null
+                // and the run proceeds solo with the §8.4 fallback detector.
+                if (!done) Debug.LogWarning("[GameManager] Connect timed out — starting solo (offline race).");
+                _connectRoutine = null;
+                BeginRunning();
             }
-            catch (Exception e)
+            finally
             {
-                Debug.LogWarning($"[GameManager] IMatchTransport.ConnectMatch threw: {e.Message}");
-                done = true;
+                GameEvents.ConnectionStateChanged -= onConn;
             }
-
-            float deadline = Time.realtimeSinceStartup + GameConfig.Active.connectTimeoutSeconds;
-            while (!done && Time.realtimeSinceStartup < deadline)
-                yield return null;
-
-            GameEvents.ConnectionStateChanged -= onConn;
-
-            // OnlineRace is set by the ConnectionStateChanged event; on timeout it stays null
-            // and the run proceeds solo with the §8.4 fallback detector.
-            if (!done) Debug.LogWarning("[GameManager] Connect timed out — starting solo (offline race).");
-            _connectRoutine = null;
-            BeginRunning();
         }
 
         private void BeginRunning()
@@ -547,6 +559,23 @@ namespace LightRunners.Gameplay
 
             // Non-match (solo) path: crash still terminates the run.
             FinalizeRun(crashed: true, causedBy: causedByPlayerId);
+        }
+
+        /// <summary>
+        /// Match-clock-expiry handler (Round-1 review fix R2-F5: previously nothing reacted to
+        /// <see cref="GameEvents.MatchExpired"/> — the player was stranded in
+        /// <see cref="GameState.Running"/> forever with the clock at zero, no summary, no Afterglow,
+        /// no return-to-lobby. Decision O ("most Lumens wins on expiry") had no UI manifestation.)
+        /// Finalizes the run, which persists it and shows RunSummaryUI; RunSummaryUI reads the
+        /// post-expiry Lumen tally (MatchManager froze the replay package before raising) so the
+        /// displayed winner matches the authoritative scoreboard.
+        /// </summary>
+        private void OnMatchExpired()
+        {
+            if (MatchManager.HasInstance && MatchManager.Instance.State == MatchState.Expired)
+            {
+                FinalizeRun(crashed: false, causedBy: null);
+            }
         }
 
         /// <summary>

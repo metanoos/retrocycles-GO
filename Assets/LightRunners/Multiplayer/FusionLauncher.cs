@@ -143,6 +143,18 @@ namespace LightRunners.Multiplayer
                     GameMode = GameMode.Host,
                     SessionName = roomName,
                     PlayerCount = cfg.maxPlayersPerRoom,
+                    // Round-1 review fix R2-F6: enable Photon host migration + a non-zero
+                    // empty-room TTL so a brief host disconnect doesn't orphan every client.
+                    // Full migration of the Lightfield match state (NetworkMatchState re-spawn,
+                    // Lumen tally continuity, gate pool re-authority) is decision-S-deferred
+                    // scope, but silent orphaning is not acceptable — EnableHostMigration at
+                    // least keeps the room alive for a reconnect attempt.
+                    EnableHostMigration = true,
+                    CustomPhotonRoomParams = new Photon.Realtime.RoomOptions
+                    {
+                        EmptyRoomTtl = cfg.lobbyIdleTimeoutSeconds * 1000, // ms; matches lobby TTL (pitfall §17.14)
+                        PlayerTtl = cfg.lobbyIdleTimeoutSeconds * 1000,
+                    },
                     // AppId/app-version live in PhotonAppSettings.asset (spec §8.1).
                 });
 
@@ -250,8 +262,36 @@ namespace LightRunners.Multiplayer
             _runner = null;
             CurrentRoomName = null;
             UnregisterAsTransport();
+            // Round-1 review fix R2-F6: warn loudly if we shut down mid-match — previously this
+            // was silent, and clients would continue with a stale scoreboard until they timed
+            // out. The match state is gone; surface it so the UI can prompt return-to-lobby.
+            if (ServiceLocator.TryGet<IMatchSession>(out var session) && session != null
+                && (session.State == MatchState.Live || session.State == MatchState.Countdown
+                    || session.State == MatchState.Warmup || session.State == MatchState.Scoring))
+            {
+                Debug.LogWarning($"[FusionLauncher] Connection lost mid-match (state={session.State}, reason={shutdownReason}). Host migration did not complete; match state is no longer authoritative. Returning to solo/offline mode.");
+            }
             RaiseConnected(false);
             CompleteConnect(false);
+        }
+
+        /// <summary>
+        /// Round-1 review fix R2-F6: was empty. Photon signals host migration here; for the
+        /// ground-only milestone we DON'T fully migrate the Lightfield match state (decision-S
+        /// deferral), but we MUST at least log the event so the failure isn't silent and re-spawn
+        /// NetworkMatchState on the new host so frozen-tail-radius replication can resume. Full
+        /// migration (Lumen tally continuity, gate pool re-authority, replay sink handoff) is a
+        /// follow-up tracked in SPEC §1.5 decision-Q row.
+        /// </summary>
+        public void OnHostMigration(NetworkRunner runner, HostMigrationToken hostMigrationToken)
+        {
+            Debug.LogWarning($"[FusionLauncher] Host migration in progress. New host: {runner.IsServer}. " +
+                             "Lightfield match state migration is partial (decision-S deferral): NetworkMatchState " +
+                             "will respawn on the new host; Lumen tally continuity is NOT guaranteed. " +
+                             "If you see scoreboard desync post-migration, end the match and restart.");
+            // The new host's OnPlayerJoined path will spawn NetworkMatchState; existing clients
+            // will receive it via Fusion's networked-object replication. No further action here
+            // for the milestone.
         }
 
         // Unused callbacks (interface completeness).

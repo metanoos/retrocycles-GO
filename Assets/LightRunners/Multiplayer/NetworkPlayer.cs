@@ -212,38 +212,38 @@ namespace LightRunners.Multiplayer
             IsCrashed = true;
             _beacon?.PlayCrashEffect();
 
-            // Host path: apply authoritative penalty then broadcast the bus event.
-            if (IsHostAuthority)
+            // Round-1 review fix R1-F7/R2-F4: the host previously applied the Lumen penalty
+            // directly here AND raised the bus event, which GameManager.OnPlayerCrashed →
+            // MatchManager.HandlePlayerCrash re-applied — a 2× penalty on the host for one
+            // crash. Single-source fix: the host no longer applies the penalty locally; it
+            // raises the bus event (the single crash signal Gameplay consumes per spec §16),
+            // and MatchManager.HandlePlayerCrash owns the authoritative ApplyCrashPenalty call
+            // (with the crash GeoPoint, which the local direct path didn't have).
+            if (!IsHostAuthority && HasInputAuthorityOnly)
             {
-                ApplyCrashPenaltyHost(PlayerId.ToString());
-            }
-            else if (HasInputAuthorityOnly)
-            {
-                // Client path: ask the host to apply the penalty authoritatively.
-                RpcReportCrash(PlayerId.ToString());
+                // Client path: ask the host to broadcast the crash. The host's resulting bus
+                // raise drives HandlePlayerCrash on the host's authoritative scoreboard.
+                GeoPoint here = _haveLast ? _lastPos : GeoPoint.Zero;
+                RpcReportCrash(PlayerId.ToString(), here.latitude, here.longitude, here.altitude);
+                // Clients do NOT raise the bus locally (R1-F14/R2): doing so fires Gameplay's
+                // crash pipeline against the client's non-authoritative scoreboard, causing
+                // visible "score dropped then bounced back" flicker when host sync overwrites.
+                // Clients observe the crash via the networked IsCrashed flag (mirrored below).
+                return;
             }
 
-            // Always raise the bus locally — Gameplay's crash pipeline consumes
-            // this regardless of authority (spec §16, preserved from §8.3).
+            // Host (or solo editor with no Fusion): raise the bus — Gameplay's single crash
+            // listener will call MatchManager.HandlePlayerCrash → scoreboard.ApplyCrashPenalty.
             GameEvents.RaisePlayerCrashed(causedByPlayerId);
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // HOST-AUTHORITATIVE LUMEN / CRASH APPLY (decision Q)
+        // HOST-AUTHORITATIVE LUMEN / GATE-COLLECT APPLY (decision Q)
         // ─────────────────────────────────────────────────────────────────────
-
-        /// <summary>
-        /// Host-only: apply the crash Lumen penalty via the authoritative
-        /// <see cref="ILumenScoreboard"/> resolved from the locator. Falls back to
-        /// a no-op if no scoreboard is registered (NullLumenScoreboard returns 0,
-        /// which is the correct inert behaviour pre-Track-A wiring).
-        /// </summary>
-        private void ApplyCrashPenaltyHost(string playerId)
-        {
-            if (!IsHostAuthority) return;
-            if (ServiceLocator.TryGet<ILumenScoreboard>(out var scoreboard) && scoreboard != null)
-                scoreboard.ApplyCrashPenalty(playerId);
-        }
+        // Note (Round-1 review fix R1-F7/R2-F4): the host no longer applies crash penalties
+        // directly. All crash penalties route through GameEvents.RaisePlayerCrashed on the host
+        // → GameManager.OnPlayerCrashed → MatchManager.HandlePlayerCrash → ApplyCrashPenalty.
+        // Single application site, correct crash GeoPoint, single stolen-Lumen record.
 
         /// <summary>
         /// Host-only: validate a Gate-collect request and, if it passes, award one
@@ -275,14 +275,39 @@ namespace LightRunners.Multiplayer
         private bool ValidateGateCollectHost(string playerId, int gateId)
         {
             if (string.IsNullOrEmpty(playerId)) return false;
+            // Round-1 review fix R1-F9/R2-F8: the prior check (gateId < 0 || gateId >= ActiveGateCount)
+            // had two problems: (a) bonus gate ids start at BonusGateIdBase (1M) and were always
+            // rejected, making referee-placed gates uncollectible; (b) there was no distance check,
+            // so a cheating client could collect any gate from anywhere. Now we resolve the gate's
+            // position via TryGetGatePosition (which handles density + bonus uniformly) and require
+            // the player to be within gateCollectionRadius of it.
             if (ServiceLocator.TryGet<IGateDirector>(out var director) && director != null)
             {
-                // ActiveGateCount is the host-authoritative pool size; if the gate
-                // id is outside the pool we reject. Track B will add geo-distance
-                // validation once gates carry an authoritative position.
-                if (gateId < 0 || gateId >= director.ActiveGateCount) return false;
+                if (!director.TryGetGatePosition(new GateId(gateId), out var gatePos)) return false;
+
+                // Distance check (decision Q host-authoritative anti-cheat). The host's
+                // NetworkPlayer carries the authoritative avatar position via PositionX/Y/Z (in
+                // world space; convert back to geo for the haversine compare). A small tolerance
+                // accounts for the tick-rate gap between the player's last authoritative update
+                // and the gate-collect RPC.
+                GeoPoint playerPos = ResolveAuthoritativePlayerGeo();
+                double dist = playerPos.HorizontalDistanceTo(gatePos);
+                float radius = GameConfig.Active.gateCollectionRadius;
+                // 2× tolerance: movement between ticks + GPS jitter (decision-N no-speed-limit
+                // means a fast runner can cover meaningful distance between authoritative ticks).
+                if (dist > radius * 2.0) return false;
             }
             return true;
+        }
+
+        /// <summary>
+        /// Resolve this avatar's authoritative geo position from the networked world-space
+        /// fields (host-side validation). Round-1 review fix: needed by the gate-distance check.
+        /// </summary>
+        private GeoPoint ResolveAuthoritativePlayerGeo()
+        {
+            Vector3 w = new Vector3(PositionX, PositionY, PositionZ);
+            return LightRunners.Location.CoordinateConverter.WorldToGeo(w);
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -303,30 +328,55 @@ namespace LightRunners.Multiplayer
         [Rpc(RpcSources.All, RpcTargets.StateAuthority)]
         private void RpcRequestGateCollect(int gateId, string playerId, RpcInfo info = default)
         {
-            // Source-tag check: only the peer that owns the input authority for
-            // playerId may request a collect for it. Without Token-verified player
-            // ids this is a soft check; full Token binding is a v2 concern.
             if (!IsHostAuthority) return;
             if (string.IsNullOrEmpty(playerId)) return;
-            // info.Source is the PlayerRef of the sender; comparing it to the
-            // input authority prevents one client from collecting on behalf of
-            // another. (Kept loose for the milestone — tightened post-Track-E.)
+            // Round-1 review fix R2-F8: tighten the source check. The prior "soft" check let a
+            // client request a collect for ANY player id (it never compared info.Source to
+            // Object.InputAuthority). Now the sender must be the input-authority peer for this
+            // avatar — a client can only collect on its own behalf. (Full Token-verified player
+            // id binding remains a v2 concern, but this closes the trivially-exploitable path.)
+            if (info.Source != Object.InputAuthority) return;
             AwardGateCollectHost(playerId, gateId);
         }
 
         /// <summary>
-        /// Client → Host: report that the local player has crashed. The host
-        /// applies the authoritative Lumen penalty and sets the networked
-        /// IsCrashed flag so all peers render the FX.
+        /// Client → Host: report that the local player has crashed. The host raises the crash
+        /// bus event (Round-1 review fix: previously applied the penalty directly here, which
+        /// (a) bypassed MatchManager.HandlePlayerCrash's GeoPoint stamping for the
+        ///     stolen-Lumen pickup, and
+        /// (b) created a second penalty application site that could double with the host's
+        ///     own OnCrash bus raise.)
+        /// Routing through the bus means there's exactly one penalty application site
+        /// (HandlePlayerCrash), exactly one stolen-Lumen record, and exactly one replay-sink
+        /// RecordCrash with full metadata. The client's crash GeoPoint is carried in the RPC
+        /// so the host stamps the correct pickup spawn site.
         /// </summary>
         [Rpc(RpcSources.All, RpcTargets.StateAuthority)]
-        private void RpcReportCrash(string playerId, RpcInfo info = default)
+        private void RpcReportCrash(string playerId, double lat, double lon, double alt, RpcInfo info = default)
         {
             if (!IsHostAuthority) return;
             if (string.IsNullOrEmpty(playerId)) return;
-            ApplyCrashPenaltyHost(playerId);
+            // Source-check: the reporter must be the input-authority peer for this avatar
+            // (Round-1 fix R2-F8: a client could otherwise spam crash reports for rivals).
+            if (info.Source != Object.InputAuthority) return;
+            // Delegate to the single crash-application path. The bus raise on the host drives
+            // GameManager.OnPlayerCrashed → MatchManager.HandlePlayerCrash with the crash site.
+            // We stash the supplied GeoPoint on a host-side field so HandlePlayerCrash can read
+            // the authoritative position when it asks LocationProvider (the host's local
+            // LocationProvider read would be the wrong player's position).
+            _reportedCrashSite = new GeoPoint(lat, lon, alt);
+            GameEvents.RaisePlayerCrashed(playerId);
             IsCrashed = true;
         }
+
+        /// <summary>
+        /// Crash GeoPoint reported via the most recent RpcReportCrash (host-side). Read by
+        /// MatchManager.HandlePlayerCrash via <see cref="GetReportedCrashSite"/> so the penalty
+        /// + stolen-Lumen pickup land at the correct spot for remote players.
+        /// </summary>
+        private GeoPoint? _reportedCrashSite;
+        /// <summary>Host-side: the GeoPoint of the most recent RpcReportCrash, or null.</summary>
+        public GeoPoint? GetReportedCrashSite() => _reportedCrashSite;
 
         /// <summary>Public seam for Track D's UI / input layer to call from a client.</summary>
         public void RequestGateCollect(int gateId)
