@@ -80,7 +80,11 @@ create index if not exists trail_points_geo_gist on public.trail_points using gi
 create index if not exists trail_points_seq_idx  on public.trail_points (trail_id, sequence_index);
 
 -- ─────────────────────────────────────────────────────────────────────────────
--- run_history — score breakdown per run; survives the geometry sweep (§23).
+-- run_history — Lumen tally per run; survives the geometry sweep (§23).
+-- NOTE: this is the post-migration shape (Track E / decision E). The deprecated
+-- score_* columns are gone; lumens INT replaces them. The lumen-scoreboard
+-- migration section near the end of this file performs the same column changes
+-- idempotently for already-deployed DBs (DROP COLUMN IF EXISTS / ADD COLUMN).
 -- ─────────────────────────────────────────────────────────────────────────────
 create table if not exists public.run_history (
     id              bigint generated always as identity primary key,
@@ -88,17 +92,13 @@ create table if not exists public.run_history (
     distance_m      double precision not null,
     duration_s      double precision not null,
     avg_speed       double precision not null,
-    score_total     int not null,
-    score_distance  int not null,
-    score_speed     int not null,
-    score_beauty    int not null,
-    score_proximity int not null,
+    lumens          int not null default 0,           -- decision E: player's Lumen tally for the run
     beacon_form     int not null default 0,
     crashed         boolean not null default false,
     recorded_at     timestamptz not null default now()
 );
 
-create index if not exists run_history_leaderboard_idx on public.run_history (score_total desc, recorded_at desc);
+create index if not exists run_history_leaderboard_idx on public.run_history (lumens desc, recorded_at desc);
 create index if not exists run_history_player_idx      on public.run_history (player_id);
 
 -- rejected_runs — implausible submissions land here, not in run_history (§22).
@@ -226,19 +226,23 @@ end;
 $$;
 
 -- record_run — validates plausibility (spec §22) then inserts history + updates stats.
--- Rejected runs return success to the client (don't teach the prober) but land in
--- rejected_runs for audit.
+-- Post-migration signature (Track E / decision E): takes p_lumens INT instead of
+-- the deprecated score_* params. Rejected runs return success to the client
+-- (don't teach the prober) but land in rejected_runs for audit.
+--
+-- Idempotency note: CREATE OR REPLACE can't change a function's parameter list,
+-- so we DROP the OLD signature first (no-op if it doesn't exist, e.g. on a
+-- fresh DB or an already-migrated DB). The new signature is then (re)created.
+drop function if exists public.record_run(
+    double precision, double precision, double precision,
+    int, int, int, int, int, int, boolean);
 create or replace function public.record_run(
-    distance_m double precision,
-    duration_s double precision,
-    avg_speed double precision,
-    score_total int,
-    score_distance int,
-    score_speed int,
-    score_beauty int,
-    score_proximity int,
-    beacon_form int,
-    crashed boolean
+    p_distance_m double precision,
+    p_duration_s double precision,
+    p_avg_speed double precision,
+    p_lumens int,
+    p_beacon_form int,
+    p_crashed boolean
 )
 returns void
 language plpgsql security definer set search_path = public
@@ -252,34 +256,28 @@ begin
     end if;
 
     -- Physical-plausibility floor (spec §22).
-    if avg_speed > 12.0 then v_reason := 'avg_speed';
-    elsif distance_m > 100000.0 then v_reason := 'distance';
-    elsif duration_s < 10.0 and distance_m > 100.0 then v_reason := 'teleport';
-    elsif score_total > 100
-        or score_distance > 40 or score_speed > 20
-        or score_beauty > 30 or score_proximity > 10
-        or score_total < 0 or score_distance < 0 or score_speed < 0
-        or score_beauty < 0 or score_proximity < 0 then v_reason := 'score_bounds';
+    if p_avg_speed > 12.0 then v_reason := 'avg_speed';
+    elsif p_distance_m > 100000.0 then v_reason := 'distance';
+    elsif p_duration_s < 10.0 and p_distance_m > 100.0 then v_reason := 'teleport';
+    elsif p_lumens < 0 then v_reason := 'lumens_negative';
     end if;
 
     if v_reason is not null then
         insert into public.rejected_runs (player_id, payload, reason)
         values (v_uid, jsonb_build_object(
-            'distance_m', distance_m, 'duration_s', duration_s, 'avg_speed', avg_speed,
-            'score_total', score_total), v_reason);
+            'distance_m', p_distance_m, 'duration_s', p_duration_s,
+            'avg_speed', p_avg_speed, 'lumens', p_lumens), v_reason);
         return; -- silent success (spec §22)
     end if;
 
     insert into public.run_history (
         player_id, distance_m, duration_s, avg_speed,
-        score_total, score_distance, score_speed, score_beauty, score_proximity,
-        beacon_form, crashed)
+        lumens, beacon_form, crashed)
     values (
-        v_uid, distance_m, duration_s, avg_speed,
-        score_total, score_distance, score_speed, score_beauty, score_proximity,
-        beacon_form, crashed);
+        v_uid, p_distance_m, p_duration_s, p_avg_speed,
+        p_lumens, p_beacon_form, p_crashed);
 
-    perform public.update_player_stats(v_uid, distance_m);
+    perform public.update_player_stats(v_uid, p_distance_m);
 end;
 $$;
 
@@ -319,28 +317,34 @@ as $$
     order by n.id, p.sequence_index;
 $$;
 
+-- Leaderboard RPCs (Track E): return best_lumens instead of best_score. The
+-- return-column rename needs a DROP first (Postgres rejects CREATE OR REPLACE
+-- that changes a RETURNS TABLE shape), so each is guarded by DROP IF EXISTS —
+-- no-op on a fresh or already-migrated DB.
+drop function if exists public.get_global_leaderboard(int);
 create or replace function public.get_global_leaderboard(max_rows int default 20)
-returns table (player_id uuid, display_name text, best_score int, recorded_at timestamptz)
+returns table (player_id uuid, display_name text, best_lumens int, recorded_at timestamptz)
 language sql stable security definer set search_path = public
 as $$
-    select r.player_id, pl.display_name, max(r.score_total) as best_score, max(r.recorded_at)
+    select r.player_id, pl.display_name, max(r.lumens) as best_lumens, max(r.recorded_at)
     from public.run_history r
     join public.players pl on pl.id = r.player_id
     group by r.player_id, pl.display_name
-    order by best_score desc
+    order by best_lumens desc
     limit least(max_rows, 100);
 $$;
 
+drop function if exists public.get_nearby_leaderboard(double precision, double precision, double precision, int);
 create or replace function public.get_nearby_leaderboard(
     center_lat double precision,
     center_lon double precision,
     radius_m double precision,
     max_rows int default 20
 )
-returns table (player_id uuid, display_name text, best_score int)
+returns table (player_id uuid, display_name text, best_lumens int)
 language sql stable security definer set search_path = public
 as $$
-    select r.player_id, pl.display_name, max(r.score_total) as best_score
+    select r.player_id, pl.display_name, max(r.lumens) as best_lumens
     from public.run_history r
     join public.players pl on pl.id = r.player_id
     join public.trails t on t.player_id = r.player_id
@@ -350,16 +354,17 @@ as $$
             st_setsrid(st_makepoint(center_lon, center_lat), 4326)::geography,
             radius_m)
     group by r.player_id, pl.display_name
-    order by best_score desc
+    order by best_lumens desc
     limit least(max_rows, 100);
 $$;
 
+drop function if exists public.get_player_best(uuid);
 create or replace function public.get_player_best(p_player_id uuid)
-returns table (best_score int, best_distance double precision, total_runs int)
+returns table (best_lumens int, best_distance double precision, total_runs int)
 language sql stable security definer set search_path = public
 as $$
     select
-        coalesce(max(r.score_total), 0),
+        coalesce(max(r.lumens), 0),
         coalesce(max(r.distance_m), 0),
         count(*)::int
     from public.run_history r
@@ -570,6 +575,306 @@ begin
     if exists (select 1 from pg_extension where extname = 'pg_cron') then
         perform cron.schedule('sweep_old_trails', '17 3 * * *', 'select public.sweep_old_trails()');
         perform cron.schedule('sweep_expired_lobbies', '*/15 * * * *', 'select public.sweep_expired_lobbies()');
+    end if;
+exception when others then
+    raise notice 'pg_cron scheduling skipped: %', sqlerrm;
+end $$;
+
+
+-- ════════════════════════════════════════════════════════════════════════════
+-- Migration: lumen-scoreboard (2026-07-18) — Track E.
+--
+-- Replaces the deprecated 4-axis RunScorer float score (distance/speed/beauty/
+-- proximity /100) with the integer Lumen tally from ILumenScoreboard (Core).
+-- Adds match metadata (matches) and per-player match results (match_players)
+-- so the "most Lumens wins" timed match (decision O) survives end-of-match.
+--
+-- This section is IDEMPOTENT: every statement uses IF EXISTS / IF NOT EXISTS /
+-- CREATE OR REPLACE, so re-applying schema.sql on an already-migrated DB is a
+-- no-op. Run it in the Supabase SQL editor or via psql; a live-DB run is a
+-- human checkpoint (this file is not verified on this machine — see README).
+-- ════════════════════════════════════════════════════════════════════════════
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migration: lumen-scoreboard — run_history column changes.
+-- Drop the score_* columns (RunScorer is gone); add lumens INT NOT NULL DEFAULT 0
+-- (the player's Lumen tally for that run; decision E).
+-- ─────────────────────────────────────────────────────────────────────────────
+alter table public.run_history
+    drop column if exists score_total,
+    drop column if exists score_distance,
+    drop column if exists score_speed,
+    drop column if exists score_beauty,
+    drop column if exists score_proximity;
+
+alter table public.run_history
+    add column if not exists lumens int not null default 0;
+
+-- The old leaderboard index keyed on score_total desc; replace it with one on
+-- lumens desc so get_global_leaderboard / get_nearby_leaderboard (updated below)
+-- can use it. DROP IF EXISTS + CREATE IF NOT EXISTS keep this idempotent.
+drop index if exists public.run_history_leaderboard_idx;
+create index if not exists run_history_leaderboard_idx on public.run_history (lumens desc, recorded_at desc);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migration: lumen-scoreboard — matches table.
+-- One row per Lightfield match (decision O: timed match, most Lumens wins).
+-- Host authority (decision Q) is resolved via a match_players row with
+-- role = 'host' (see below), NOT a denormalized column on matches — so host
+-- handoff (if added later) is a single-row update.
+-- ─────────────────────────────────────────────────────────────────────────────
+create table if not exists public.matches (
+    id                uuid primary key default gen_random_uuid(),
+    room_id           text,                                       -- Fusion room name (ILobbyService.ActiveRoomName)
+    started_at        timestamptz not null default now(),
+    ended_at          timestamptz,
+    duration_seconds  int,
+    winner_player_id  text,                                       -- player_id from match_players (TEXT — offline ids aren't UUIDs)
+    created_at        timestamptz not null default now()
+);
+
+create index if not exists matches_started_idx  on public.matches (started_at);  -- retention sweep
+create index if not exists matches_room_idx     on public.matches (room_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migration: lumen-scoreboard — match_players table.
+-- One row per (match, player). role matches the PlayerRole enum (decision Q/R):
+-- 'runner' | 'host' | 'referee'. finish_rank is 1-based; lumens is the player's
+-- final Lumen tally for this match (decision E).
+-- ─────────────────────────────────────────────────────────────────────────────
+create table if not exists public.match_players (
+    match_id      uuid not null references public.matches (id) on delete cascade,
+    player_id     text not null,
+    lumens        int  not null default 0,
+    finish_rank   int,
+    role          text not null check (role in ('runner','host','referee')),
+    created_at    timestamptz not null default now(),
+    primary key (match_id, player_id)
+);
+
+create index if not exists match_players_match_idx on public.match_players (match_id);
+create index if not exists match_players_player_idx on public.match_players (player_id);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migration: lumen-scoreboard — RLS for matches + match_players.
+--
+-- matches: SELECT for participants (a match_players row exists for them);
+--          INSERT/UPDATE restricted to the match's host (resolved via a
+--          match_players row with role = 'host'). Direct client writes to
+--          ended_at / winner_player_id / duration_seconds are blocked — those
+--          go through the finalize_match SECURITY DEFINER RPC (host-only check
+--          inside). We still allow the host row-existence policy as a defense-
+--          in-depth guard for create_match's initial insert.
+--
+-- match_players: SELECT for the row owner OR any host of the same match;
+--                client INSERT/UPDATE blocked — all writes go through the
+--                SECURITY DEFINER RPCs (create_match / record_match_result),
+--                which enforce host-authority inside.
+-- ─────────────────────────────────────────────────────────────────────────────
+alter table public.matches        enable row level security;
+alter table public.match_players  enable row level security;
+
+-- matches SELECT: participants only.
+drop policy if exists matches_read on public.matches;
+create policy matches_read on public.matches for select using (
+    exists (select 1 from public.match_players mp
+            where mp.match_id = matches.id and mp.player_id = auth.uid()::text)
+);
+
+-- matches INSERT: only if the caller will be the host (defense-in-depth; the
+-- real authority check is in create_match). A player may insert a match row
+-- only when no host exists yet for that id (first-writer) — enforced by the
+-- RPC. Here we permit the insert shape; the RPC controls who can call it.
+drop policy if exists matches_insert on public.matches;
+create policy matches_insert on public.matches for insert with check (
+    exists (select 1 from public.match_players mp
+            where mp.match_id = matches.id
+              and mp.player_id = auth.uid()::text
+              and mp.role = 'host')
+    or not exists (select 1 from public.match_players mp where mp.match_id = matches.id)
+);
+
+-- matches UPDATE: only the host of that match (so ended_at / winner can move).
+drop policy if exists matches_update on public.matches;
+create policy matches_update on public.matches for update using (
+    exists (select 1 from public.match_players mp
+            where mp.match_id = matches.id
+              and mp.player_id = auth.uid()::text
+              and mp.role = 'host')
+);
+
+-- match_players SELECT: own row, or you're the host of the match.
+drop policy if exists match_players_read on public.match_players;
+create policy match_players_read on public.match_players for select using (
+    match_players.player_id = auth.uid()::text
+    or exists (select 1 from public.match_players h
+               where h.match_id = match_players.match_id
+                 and h.player_id = auth.uid()::text
+                 and h.role = 'host')
+);
+-- match_players writes: client-direct writes are NOT allowed; all writes go
+-- through the SECURITY DEFINER RPCs below. (No insert/update/delete policy =
+-- denied at the RLS layer for non-SUPERUSER roles, which is what we want.)
+
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migration: lumen-scoreboard — record_run RPC replacement.
+-- Drops the score_* params; takes p_lumens INT instead. BACKWARDS-COMPAT NOTE:
+-- any client still posting the OLD signature (score_total, score_distance, ...)
+-- will get a PostgREST 400 ("function parameter does not exist"). That is the
+-- intended hard cutover signal — Track D's RunSummaryUI.cs is the only caller
+-- and is updated in lockstep. Queued offline ops (PendingOpsQueue) from before
+-- the migration must be drained or cleared; a mismatched payload stays queued
+-- and retries forever — see PendingOpsQueue.ClearForFn (Track E adds nothing
+-- here, just flagging for ops).
+--
+-- NOTE: the canonical post-migration record_run definition lives above (in the
+-- Player stats / scoring RPCs section), preceded by a `drop function if exists`
+-- guard for the OLD signature so CREATE OR REPLACE can re-create it cleanly.
+-- It is not repeated here — single source of truth.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migration: lumen-scoreboard — leaderboard RPCs now read lumens, not score_total.
+-- NOTE: the canonical post-migration definitions live above (near record_run),
+-- each preceded by a `drop function if exists` guard so an already-deployed DB
+-- whose leaderboard functions return best_score can be re-created cleanly. They
+-- are not repeated here — repeating CREATE OR REPLACE with the same shape is a
+-- harmless no-op, but keeping a single source of truth is easier to review.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migration: lumen-scoreboard — match lifecycle RPCs (all SECURITY DEFINER).
+-- Mirror the lobby RPC pattern (raise exception '<token>'; client surfaces the
+-- token verbatim via LobbyServices.ErrorToken). Tokens: not_authenticated,
+-- not_host, not_found, bad_role.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+-- create_match — host calls this when the match begins (IMatchSession.BeginMatch).
+-- Inserts a matches row + a host match_players row; returns the match id.
+create or replace function public.create_match(
+    p_room_id text,
+    p_host_player_id text
+)
+returns uuid
+language plpgsql security definer set search_path = public
+as $$
+declare
+    v_uid uuid := auth.uid();
+    v_match_id uuid;
+begin
+    if v_uid is null then raise exception 'not_authenticated'; end if;
+
+    insert into public.matches (room_id)
+    values (p_room_id)
+    returning id into v_match_id;
+
+    insert into public.match_players (match_id, player_id, lumens, finish_rank, role)
+    values (v_match_id, p_host_player_id, 0, null, 'host');
+
+    return v_match_id;
+end;
+$$;
+
+-- record_match_result — upsert a match_players row. Host-only for OTHER players;
+-- a player may record their OWN result (the host calls this on their behalf in
+-- the normal flow, but allowing self-write is harmless and simplifies offline
+-- reconcile). Lumens/rank come from the authoritative ILumenScoreboard.
+create or replace function public.record_match_result(
+    p_match_id uuid,
+    p_player_id text,
+    p_lumens int,
+    p_finish_rank int,
+    p_role text
+)
+returns void
+language plpgsql security definer set search_path = public
+as $$
+declare
+    v_uid uuid := auth.uid();
+    v_caller_uid text;
+begin
+    if v_uid is null then raise exception 'not_authenticated'; end if;
+    v_caller_uid := v_uid::text;
+
+    if p_role is null or p_role not in ('runner','host','referee') then
+        raise exception 'bad_role';
+    end if;
+
+    if not exists (select 1 from public.matches m where m.id = p_match_id) then
+        raise exception 'not_found';
+    end if;
+
+    -- Host can write any player's row; a player may write their own.
+    if p_player_id <> v_caller_uid and not exists (
+        select 1 from public.match_players h
+        where h.match_id = p_match_id
+          and h.player_id = v_caller_uid
+          and h.role = 'host')
+    then
+        raise exception 'not_host';
+    end if;
+
+    insert into public.match_players (match_id, player_id, lumens, finish_rank, role)
+    values (p_match_id, p_player_id, p_lumens, p_finish_rank, p_role)
+    on conflict (match_id, player_id) do update
+       set lumens      = excluded.lumens,
+           finish_rank = excluded.finish_rank,
+           role        = excluded.role;
+end;
+$$;
+
+-- finalize_match — host-only; sets ended_at / winner / duration. Called by the
+-- host when IMatchSession.EndMatch fires (decision O).
+create or replace function public.finalize_match(
+    p_match_id uuid,
+    p_winner_player_id text,
+    p_duration_seconds int
+)
+returns void
+language plpgsql security definer set search_path = public
+as $$
+declare
+    v_uid uuid := auth.uid();
+    v_caller_uid text;
+begin
+    if v_uid is null then raise exception 'not_authenticated'; end if;
+    v_caller_uid := v_uid::text;
+
+    if not exists (
+        select 1 from public.match_players h
+        where h.match_id = p_match_id
+          and h.player_id = v_caller_uid
+          and h.role = 'host')
+    then
+        raise exception 'not_host';
+    end if;
+
+    update public.matches
+    set ended_at         = now(),
+        winner_player_id = p_winner_player_id,
+        duration_seconds = p_duration_seconds
+    where id = p_match_id;
+end;
+$$;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Migration: lumen-scoreboard — retention sweep for matches.
+-- Same 30-day window as trails (spec §23). match_players cascade-deletes with
+-- matches (ON DELETE CASCADE). run_history (now lumens) still survives — it's
+-- the long-term player-stats ledger, not match-scoped.
+-- ─────────────────────────────────────────────────────────────────────────────
+create or replace function public.sweep_old_matches()
+returns void
+language sql security definer set search_path = public
+as $$
+    delete from public.matches where started_at < now() - interval '30 days';
+$$;
+
+do $$
+begin
+    if exists (select 1 from pg_extension where extname = 'pg_cron') then
+        perform cron.schedule('sweep_old_matches', '19 3 * * *', 'select public.sweep_old_matches()');
     end if;
 exception when others then
     raise notice 'pg_cron scheduling skipped: %', sqlerrm;
