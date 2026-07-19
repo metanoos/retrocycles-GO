@@ -148,10 +148,26 @@ namespace LightRunners.Core
     /// </summary>
     public interface IGateDirector
     {
+        /// <summary>
+        /// Count of ACTIVE BASELINE (density-spawned) gates currently in play — bonus/referee
+        /// gates are excluded. Round-1 review fix R1-F10: previously this included bonus gates,
+        /// which broke <c>ValidateGateCollectHost</c>'s id-range bound (bonus ids start at
+        /// 1_000_000 and were always out-of-range).
+        /// </summary>
         int ActiveGateCount { get; }
+        /// <summary>Count of referee-placed bonus gates currently active (decision R).</summary>
+        int ActiveBonusGateCount { get; }
         event Action<GateId, GeoPoint, GatePlacement> GateSpawned;
         event Action<GateId> GateDespawned;
         event Action<GateId, string> GateCollected;    // (gateId, collectorPlayerId)
+
+        /// <summary>
+        /// Look up a gate's authoritative position. Used by host-side gate-collect validation
+        /// (Round-1 fix R1-F9 / R2-F8: distance check) and by the replay sink to record where
+        /// each Lumen was collected (Round-1 fix R1-F15). Returns false for unknown /
+        /// already-collected ids.
+        /// </summary>
+        bool TryGetGatePosition(GateId id, out GeoPoint position);
 
         /// <summary>Initialize the gate pool to max(1, ceil(playerCount × gatesPerPlayer)). Decision M.</summary>
         void ConfigureForPlayers(int playerCount, float gatesPerPlayer);
@@ -227,9 +243,30 @@ namespace LightRunners.Core
         /// <summary>Selected tail radius (m). Returns the host value once frozen, else the config default.</summary>
         float FrozenTailRadius { get; }
         bool IsFrozen { get; }
-        /// <summary>Host-only: freeze the radius at its current value. No-op once frozen.</summary>
+        /// <summary>Host-only: freeze the radius at its local config value. No-op once frozen.</summary>
         void FreezeAtCountdown();
+        /// <summary>
+        /// Freeze at an externally-supplied radius (decision T host→client propagation).
+        /// Clients receive the host's authoritative value via <c>NetworkMatchState</c> and call
+        /// this so their local collision threshold matches the host's. No-op once frozen.
+        /// </summary>
+        void ApplyNetworkedFreeze(float networkedRadius);
         /// <summary>Reset to unfrozen (called between matches).</summary>
         void Unfreeze();
+    }
+
+    /// <summary>
+    /// Spawns stealable-Lumen pickups at crash sites (decision F). The authoritative queue of
+    /// dropped Lumens lives on <see cref="ILumenScoreboard"/>; this spawner drains it and
+    /// renders + lifetime-manages the pickups. Implemented by
+    /// <c>LightRunners.Lightfield.StolenLumenPickupSpawner</c>; the Gameplay layer resolves it
+    /// from the <see cref="ServiceLocator"/> so it doesn't take a hard Lightfield reference at
+    /// every call site. Round-1 review fix: the spawner existed but was never wired into a
+    /// scene; MatchManager now triggers it on crash.
+    /// </summary>
+    public interface IStolenLumenSpawner
+    {
+        /// <summary>Spawn pickups for any records the scoreboard has queued. Called on crash.</summary>
+        void DrainAndSpawn();
     }
 }

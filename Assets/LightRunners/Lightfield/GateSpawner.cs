@@ -141,13 +141,35 @@ namespace LightRunners.Lightfield
         private readonly Dictionary<GateId, LumenGateState> _active = new Dictionary<GateId, LumenGateState>();
         private int _nextDensityId = 1;
         private int _nextBonusId = BonusGateIdBase;
+        private int _densityCount;
+        private int _bonusCount;
         private bool _hooked;
 
-        public int ActiveGateCount => _active.Count;
+        /// <summary>
+        /// Density-pool (baseline) gate count only. Round-1 review fix R1-F10/R2: previously
+        /// returned <c>_active.Count</c> which included bonus gates, breaking
+        /// <c>ValidateGateCollectHost</c>'s id-range bound. Bonus gates are tracked separately
+        /// via <see cref="ActiveBonusGateCount"/>.
+        /// </summary>
+        public int ActiveGateCount => _densityCount;
+
+        /// <summary>Referee-placed bonus gates currently active (decision R).</summary>
+        public int ActiveBonusGateCount => _bonusCount;
 
         public event Action<GateId, GeoPoint, GatePlacement> GateSpawned;
         public event Action<GateId> GateDespawned;
         public event Action<GateId, string> GateCollected;
+
+        /// <summary>
+        /// Look up an active gate's position (Round-1 fix R1-F15/R2-F8: host-side validation and
+        /// replay sink both need gate positions). Returns false for unknown/collected ids.
+        /// </summary>
+        public bool TryGetGatePosition(GateId id, out GeoPoint position)
+        {
+            if (_active.TryGetValue(id, out var state)) { position = state.Position; return true; }
+            position = default;
+            return false;
+        }
 
         /// <param name="volume">The play volume gates must spawn inside.</param>
         /// <param name="sampler">Spawn position source; null → <see cref="DefaultGatePositionSampler"/>.</param>
@@ -204,6 +226,7 @@ namespace LightRunners.Lightfield
             var id = new GateId(_nextBonusId++);
             var state = new LumenGateState(id, at, placement, isBonus: true);
             _active[id] = state;
+            _bonusCount++;
 
             GameEvents.RaiseGateSpawned(id.Value, at.latitude, at.longitude, at.altitude, placement);
             try { GateSpawned?.Invoke(id, at, placement); }
@@ -277,6 +300,7 @@ namespace LightRunners.Lightfield
             var id = new GateId(_nextDensityId++);
             var state = new LumenGateState(id, at, GatePlacement.Ground, isBonus: false);
             _active[id] = state;
+            _densityCount++;
 
             GameEvents.RaiseGateSpawned(id.Value, at.latitude, at.longitude, at.altitude, GatePlacement.Ground);
             try { GateSpawned?.Invoke(id, at, GatePlacement.Ground); }
@@ -285,7 +309,12 @@ namespace LightRunners.Lightfield
 
         private void DespawnGate(GateId id)
         {
+            // Capture IsBonus BEFORE removing so we can maintain the split counters
+            // (Round-1 review fix R1-F10).
+            bool isBonus = _active.TryGetValue(id, out var s) && s.IsBonus;
             if (!_active.Remove(id)) return;
+            if (isBonus) _bonusCount = Math.Max(0, _bonusCount - 1);
+            else _densityCount = Math.Max(0, _densityCount - 1);
             GameEvents.RaiseGateDespawned(id.Value);
             try { GateDespawned?.Invoke(id); }
             catch (Exception ex) { UnityEngine.Debug.LogException(ex); }

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using LightRunners.Core;
 using LightRunners.Trail;
+using LightRunners.Afterglow;
 
 namespace LightRunners.Gameplay
 {
@@ -109,6 +110,8 @@ namespace LightRunners.Gameplay
         private LumenScoreboard _scoreboard;
         private TailAuthority _tailAuthority;
         private SnakeTailModel _snakeTailModel;
+        // Track F replay sink — constructed in Awake (Round-1 review fix).
+        private ReplayPackageSink _replaySink;
 
         /// <summary>Match-relative time in seconds (0 outside a live match).</summary>
         private double MatchClockSeconds()
@@ -132,11 +135,19 @@ namespace LightRunners.Gameplay
             ServiceLocator.Register<ILumenScoreboard>(_scoreboard);
             ServiceLocator.Register<ITailAuthority>(_tailAuthority);
 
+            // Construct & register the real Track F replay sink (Round-1 review fix F1: this was
+            // never constructed, so the locator kept NullMatchReplaySink and Afterglow was always
+            // empty). Gameplay references Afterglow directly now (asmdef updated) so we can drop
+            // the prior reflection-based lookup.
+            _replaySink = new ReplayPackageSink();
+            _replaySink.BindToEventBus();
+            ServiceLocator.Register<IMatchReplaySink>(_replaySink);
+
             // Register self as the match session (overwrites NullMatchSession).
             ServiceLocator.Register<IMatchSession>(this);
 
             // Subscribe to the static bus (mirrors GameManager's pattern; we never reference
-            // Multiplayer / Backend / Afterglow directly — those assemblies push events here).
+            // Multiplayer / Backend directly — those assemblies push events here).
             // NOTE: we deliberately do NOT subscribe to GameEvents.PlayerCrashed — that would
             // double-handle with GameManager.OnPlayerCrashed, which is the single crash listener
             // and calls MatchManager.HandlePlayerCrash directly with the crash GeoPoint. The
@@ -149,6 +160,7 @@ namespace LightRunners.Gameplay
         {
             GameEvents.ConnectionStateChanged -= OnBusConnectionStateChanged;
             GameEvents.GateCollected -= OnBusGateCollected;
+            try { _replaySink?.UnbindFromEventBus(); } catch { /* idempotent */ }
         }
 
         private void Update()
@@ -366,6 +378,16 @@ namespace LightRunners.Gameplay
                 sink.RecordCrash(playerId, at, MatchClockSeconds(), tier, dropped);
             }
 
+            // Drain dropped-Lumen pickups (Round-1 review fix R1-F2/R2-F3): the scoreboard enqueues
+            // a StolenLumenRecord per crash; the gameplay layer drains it and renders the
+            // stealable pickups at the crash site. Previously nothing drained the queue, so
+            // dropped Lumens never re-entered play AND the queue leaked memory for the match.
+            if (dropped > 0)
+            {
+                try { ServiceLocator.Get<IStolenLumenSpawner>()?.DrainAndSpawn(); }
+                catch (Exception e) { Debug.LogException(e); }
+            }
+
             // Respawn the runner (decision F). For the milestone we mark a grace window; the
             // concrete respawn (reset the trail / teleport the avatar) is wired by GameManager in
             // response to a RespawnRequested event so this class stays free of TrailManager /
@@ -391,17 +413,36 @@ namespace LightRunners.Gameplay
 
         private void OnBusGateCollected(int gateIdValue, string collectorPlayerId)
         {
-            // Track A's scoreboard awards +1 Lumen on every GateCollected bus event (it
-            // subscribes itself). We use this signal only to grow the known-player roster.
-            if (!string.IsNullOrEmpty(collectorPlayerId)) _knownPlayers.Add(collectorPlayerId);
+            // Round-1 review fix F3/R2-F1: the prior implementation only grew the roster and
+            // forwarded to the replay sink — it NEVER called scoreboard.Award, so the Lumen
+            // tally stayed at zero forever in any runtime path that didn't go through a Fusion
+            // host RPC. The doc-comment claiming "Track A's scoreboard awards on every
+            // GateCollected" was false. Award +1 Lumen here, on every collection, offline or
+            // online. (Online: the host-side NetworkPlayer.AwardGateCollectHost also awards;
+            // that path is gated on FUSION_WEAVER and host-authority, so in solo/editor this is
+            // the sole award site. In a hosted match the host still gets the final say via its
+            // own authoritative scoreboard.)
+            if (string.IsNullOrEmpty(collectorPlayerId)) return;
+            _knownPlayers.Add(collectorPlayerId);
 
-            // Forward the lumen record to the replay sink with the gate's position when we can
-            // resolve it. The IGateDirector contract doesn't expose per-gate positions; the
-            // concrete GateSpawner (Track B) keeps an ActiveGates snapshot, but resolving that
-            // from the interface would need a cast. We accept the missing position for the
-            // milestone (RecordLumen with a default point is still better than skipping).
+            int newTotal = _scoreboard != null
+                ? _scoreboard.Award(collectorPlayerId)
+                : (ServiceLocator.Get<ILumenScoreboard>()?.Award(collectorPlayerId) ?? 0);
+
+            // Forward to the replay sink with the gate's position when we can resolve it.
+            // Track B's GateSpawner exposes an ActiveGates snapshot; resolve via the concrete
+            // type (Round-1 fix R1-F15: prior code passed default GeoPoint, recording every
+            // Lumen at lat=0/lon=0 in Afterglow). Fall back to default if lookup fails.
+            GeoPoint at = default;
+            if (ServiceLocator.TryGet<IGateDirector>(out var director))
+            {
+                foreach (var g in director.ActiveGates)
+                {
+                    if (g.Id.Value == gateIdValue) { at = g.Position; break; }
+                }
+            }
             if (ServiceLocator.TryGet<IMatchReplaySink>(out var sink) && sink != null)
-                sink.RecordLumen(collectorPlayerId, default, MatchClockSeconds());
+                sink.RecordLumen(collectorPlayerId, at, MatchClockSeconds());
         }
 
         // ─────────────────────────────────────────────────────────────────────

@@ -69,6 +69,20 @@ namespace LightRunners.Trail
         }
 
         /// <summary>
+        /// Client-side: freeze at the host's authoritative radius (decision T host→client
+        /// propagation). No-op once frozen (the host's first value wins). Clamps to a safe
+        /// minimum so a corrupt networked value can't produce a zero or negative collision
+        /// threshold. Round-1 review fix: previously clients froze to their local config value,
+        /// which could diverge from the host and produce contradictory crash arbitration.
+        /// </summary>
+        public void ApplyNetworkedFreeze(float networkedRadius)
+        {
+            if (_frozenTailRadius.HasValue) return;
+            float v = networkedRadius < 0.05f ? 0.05f : networkedRadius;
+            _frozenTailRadius = v;
+        }
+
+        /// <summary>
         /// Reset to unfrozen (call between matches so the next countdown re-freezes fresh).
         /// </summary>
         public void Unfreeze()

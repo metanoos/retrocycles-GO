@@ -46,9 +46,11 @@ namespace LightRunners.Core
     public sealed class NullGateDirector : IGateDirector
     {
         public int ActiveGateCount => 0;
+        public int ActiveBonusGateCount => 0;
         public event Action<GateId, GeoPoint, GatePlacement> GateSpawned { add { } remove { } }
         public event Action<GateId> GateDespawned { add { } remove { } }
         public event Action<GateId, string> GateCollected { add { } remove { } }
+        public bool TryGetGatePosition(GateId id, out GeoPoint position) { position = default; return false; }
         public void ConfigureForPlayers(int playerCount, float gatesPerPlayer) { }
         public void PlaceBonusGate(GeoPoint at, GatePlacement placement, string refereeToken) { }
     }
@@ -89,6 +91,13 @@ namespace LightRunners.Core
         public float FrozenTailRadius => 0.5f;
         public bool IsFrozen => false;
         public void FreezeAtCountdown() { }
+        public void ApplyNetworkedFreeze(float networkedRadius) { }
         public void Unfreeze() { }
+    }
+
+    /// <summary>No-op <see cref="IStolenLumenSpawner"/>: dropped Lumens never re-enter play.</summary>
+    public sealed class NullStolenLumenSpawner : IStolenLumenSpawner
+    {
+        public void DrainAndSpawn() { }
     }
 }

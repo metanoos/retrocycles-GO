@@ -163,20 +163,38 @@ namespace LightRunners.Lightfield
     /// <summary>
     /// Optional host-side singleton that bridges <see cref="GameEvents.LumensChanged"/> (Track A's
     /// scoreboard) to <see cref="StolenLumenPickup"/> spawns. Attach once per match; enable in
-    /// <see cref="MatchState.Live"/>. The cleaner contract (Track A exposes a dropped-Lumen
-    /// queue of <see cref="StolenLumenRecord"/>) replaces this heuristic post-milestone — see
-    /// the StolenLumenPickup contract note. Decision F, decision S.
+    /// <see cref="MatchState.Live"/>.
+    ///
+    /// Round-1 review fix R1-F2/R2-F3: previously this spawner observed
+    /// <c>GameEvents.LumensChanged</c> negative deltas as a heuristic, was never placed in any
+    /// scene, and the authoritative <c>StolenLumenQueue</c> on <c>ILumenScoreboard</c> was never
+    /// drained. It now implements <see cref="IStolenLumenSpawner"/> and drains the queue directly
+    /// (which carries the crash GeoPoint + lifetime) when <see cref="DrainAndSpawn"/> is called
+    /// by <c>MatchManager.HandlePlayerCrash</c>. The LumensChanged heuristic subscription is kept
+    /// as a fallback for any drops that bypass the queue. Decision F, decision S.
     /// </summary>
-    public sealed class StolenLumenPickupSpawner : MonoBehaviour
+    public sealed class StolenLumenPickupSpawner : MonoBehaviour, IStolenLumenSpawner
     {
-        [Tooltip("Track each runner's last known position so we can spawn a pickup at the crash site. Updates from GameEvents.LumensChanged alone don't carry geo; in production this is fed by the per-tick position pipeline.")]
+        [Tooltip("Track each runner's last known position so we can spawn a pickup at the crash site for drops that arrive via the LumensChanged heuristic path.")]
         [SerializeField] private bool _enabled = true;
 
         private readonly System.Collections.Generic.Dictionary<string, GeoPoint> _lastPositions =
             new System.Collections.Generic.Dictionary<string, GeoPoint>();
 
-        private void OnEnable() => GameEvents.LumensChanged += OnLumensChanged;
-        private void OnDisable() => GameEvents.LumensChanged -= OnLumensChanged;
+        private void OnEnable()
+        {
+            GameEvents.LumensChanged += OnLumensChanged;
+            // Register self as the IStolenLumenSpawner (overwrites NullStolenLumenSpawner).
+            // Round-1 review fix: nothing previously registered the real spawner.
+            ServiceLocator.Register<IStolenLumenSpawner>(this);
+        }
+        private void OnDisable()
+        {
+            GameEvents.LumensChanged -= OnLumensChanged;
+            // Only unregister if we still own the slot (another instance may have registered).
+            if (ServiceLocator.Get<IStolenLumenSpawner>() == this)
+                ServiceLocator.Unregister<IStolenLumenSpawner>();
+        }
 
         /// <summary>Feed the latest geo position for a runner (called by the position pipeline per tick).</summary>
         public void UpdatePlayerPosition(string playerId, GeoPoint at)
@@ -185,13 +203,34 @@ namespace LightRunners.Lightfield
             _lastPositions[playerId] = at;
         }
 
+        /// <summary>
+        /// Drain the authoritative dropped-Lumen queue on the registered <c>ILumenScoreboard</c>
+        /// and spawn a <see cref="StolenLumenPickup"/> for each record. Called by
+        /// <c>MatchManager.HandlePlayerCrash</c>. Each record carries the crash GeoPoint + the
+        /// number of Lumens dropped (a single crash may drop 1 or 2 — the queue is per-record,
+        /// one record per crash, so we spawn one pickup per record). Round-1 review fix.
+        /// </summary>
+        public void DrainAndSpawn()
+        {
+            if (!_enabled) return;
+            // Resolve the concrete LumenScoreboard from the locator (it owns the queue).
+            var scoreboard = ServiceLocator.Get<ILumenScoreboard>() as LightRunners.Trail.LumenScoreboard;
+            if (scoreboard == null) return;
+            while (scoreboard.TryDequeueStolenLumen(out var record))
+            {
+                if (!record.IsValid) continue;
+                StolenLumenPickup.CreateInstance(record.At, record.PlayerId);
+            }
+        }
+
         private void OnLumensChanged(string playerId, int newTotal)
         {
             if (!_enabled || string.IsNullOrEmpty(playerId)) return;
             if (!_lastPositions.TryGetValue(playerId, out var pos))
             {
                 // Heuristic limitation: no last-known position yet → cannot place a pickup.
-                // Cleaner contract (Track A queue) ships the geo with the drop event.
+                // The authoritative path (DrainAndSpawn) reads the crash GeoPoint from the queue
+                // and doesn't need this; this is a fallback for any drops that bypass the queue.
                 return;
             }
 
