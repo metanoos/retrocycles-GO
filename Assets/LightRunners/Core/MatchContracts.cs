@@ -62,18 +62,27 @@ namespace LightRunners.Core
         event Action<string, int> LumensChanged;       // (playerId, newTotal)
         event Action<string> LeaderChanged;            // (newLeaderId | null as empty string)
 
-        /// <summary>Award one Lumen (a Gate touch). Returns the player's new total.</summary>
+        /// <summary>Award one Lumen (Gate touch). Returns the player's new total.</summary>
         int Award(string playerId);
 
         /// <summary>
         /// Apply crash penalty (decision F). Tier is host-authoritative: leader loses
         /// <c>crashLumenLossLeader</c>, anyone else loses <c>crashLumenLossNonLeader</c>;
         /// both capped by held score. Returns the actual amount dropped (>= 0).
+        /// <paramref name="at"/> optionally stamps the crash site so dropped-Lumen pickups
+        /// and replay sinks record an accurate position (decision F); defaults to origin.
         /// </summary>
-        int ApplyCrashPenalty(string playerId);
+        int ApplyCrashPenalty(string playerId, GeoPoint at = default);
 
         /// <summary>Tier for crash-penalty purposes (decision F).</summary>
         CrashTier GetCrashTier(string playerId);
+
+        /// <summary>
+        /// Players and their Lumen totals, ordered by Lumens descending (ties stable).
+        /// Used by RunSummaryUI for true finish-rank display and by Afterglow for
+        /// FinishOrder. Returns an empty sequence if no players have scored.
+        /// </summary>
+        System.Collections.Generic.IEnumerable<(string playerId, int lumens)> OrderedStandings { get; }
     }
 
     /// <summary>

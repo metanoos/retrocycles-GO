@@ -36,8 +36,10 @@ namespace LightRunners.Core
         public event Action<string> LeaderChanged { add { } remove { } }
         public int GetLumens(string playerId) => 0;
         public int Award(string playerId) => 0;
-        public int ApplyCrashPenalty(string playerId) => 0;
+        public int ApplyCrashPenalty(string playerId, GeoPoint at = default) => 0;
         public CrashTier GetCrashTier(string playerId) => CrashTier.NonLeader;
+        public System.Collections.Generic.IEnumerable<(string playerId, int lumens)> OrderedStandings
+            => System.Array.Empty<(string, int)>();
     }
 
     /// <summary>No-op <see cref="IGateDirector"/>: spawns/collects nothing.</summary>
