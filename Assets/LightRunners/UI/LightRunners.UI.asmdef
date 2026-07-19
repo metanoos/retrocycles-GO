@@ -3,7 +3,9 @@
     "rootNamespace": "LightRunners.UI",
     "references": [
         "LightRunners.Core",
-        "LightRunners.Beacon"
+        "LightRunners.Beacon",
+        "LightRunners.Trail",
+        "LightRunners.Location"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
