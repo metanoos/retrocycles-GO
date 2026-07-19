@@ -1,0 +1,25 @@
+{
+    "name": "LightRunners.Tests.Afterglow",
+    "rootNamespace": "LightRunners.Afterglow.Tests",
+    "references": [
+        "LightRunners.Core",
+        "LightRunners.Afterglow",
+        "UnityEngine.TestRunner",
+        "UnityEditor.TestRunner"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
