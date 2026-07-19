@@ -112,14 +112,22 @@ namespace LightRunners.Gameplay
         private static int ComputeRank(ILumenScoreboard scoreboard, string localPlayerId)
         {
             if (scoreboard == null || string.IsNullOrEmpty(localPlayerId)) return 0;
-            // The scoreboard interface doesn't expose the full roster, so we approximate: the
-            // leader is rank 1; anyone else is unranked for the milestone. A richer roster API
-            // on ILumenScoreboard (TODO for Track A) would let us compute a true finish order.
-            // For now, leader ⇒ rank 1, non-leader ⇒ rank 2 (the only other tier the scoreboard
-            // exposes is GetCrashTier which is not what we want here).
-            string leader = scoreboard.LeaderPlayerId ?? string.Empty;
-            if (string.IsNullOrEmpty(leader)) return 1;            // tied / no leader → call it 1
-            return leader == localPlayerId ? 1 : 2;
+            // Use the OrderedStandings roster (Phase 0.5 widening) for true finish order.
+            // Standard competition ranking: players tied on Lumens share a rank equal to
+            // 1 + the count of strictly-higher scorers.
+            int? myLumens = null;
+            foreach ((string pid, int lumens) in scoreboard.OrderedStandings)
+            {
+                if (pid == localPlayerId) { myLumens = lumens; break; }
+            }
+            if (!myLumens.HasValue) return 0; // player not on the board
+            int rank = 1;
+            foreach ((string pid, int lumens) in scoreboard.OrderedStandings)
+            {
+                if (pid == localPlayerId) break;
+                if (lumens > myLumens.Value) rank++;
+            }
+            return rank;
         }
 
         private static string LeaderDisplayName(string leaderId, string localPlayerId)

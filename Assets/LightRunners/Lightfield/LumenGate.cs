@@ -18,6 +18,32 @@ namespace LightRunners.Lightfield
     }
 
     /// <summary>
+    /// Concrete <see cref="IRunnerIdentity"/> for the local runner avatar (decision G/L).
+    /// Attached to the runner prefab alongside the <c>"Runner"</c> tag so <see cref="LumenGate"/>
+    /// and <see cref="StolenLumenPickup"/> can resolve the colliding player. The spawner
+    /// (<c>GameManager</c> for local, <c>NetworkPlayer</c> for remote) calls <see cref="SetPlayerId"/>
+    /// when the avatar is instantiated; until then <see cref="PlayerId"/> is empty and gates
+    /// collect as "unknown" (with a warning, per the LumenGate contract).
+    ///
+    /// Reconciliation addition (Track D did not ship an IRunnerIdentity impl; this closes the
+    /// wiring gap so the milestone loop resolves the collector without per-trigger warnings).
+    /// </summary>
+    public sealed class LocalRunnerIdentity : MonoBehaviour, IRunnerIdentity
+    {
+        /// <summary>Auth.uid of the owning runner. Empty until <see cref="SetPlayerId"/> is called.</summary>
+        public string PlayerId { get; private set; } = string.Empty;
+
+        /// <summary>Spawner-side setter. Idempotent; safe to call repeatedly with the same id.</summary>
+        public void SetPlayerId(string playerId)
+        {
+            if (!string.IsNullOrEmpty(playerId)) PlayerId = playerId;
+        }
+
+        /// <summary>Reset between matches (e.g. on despawn). PlayerId becomes empty again.</summary>
+        public void Clear() => PlayerId = string.Empty;
+    }
+
+    /// <summary>
     /// A glowing Lumen Gate anchored to the ground (decision G): a hemisphere visual (the lower
     /// half of a sphere buried at <c>transform.position.y</c>) plus a single spherical trigger
     /// volume of radius <c>GameConfig.Active.gateCollectionRadius</c> (decision L). A runner
@@ -156,8 +182,10 @@ namespace LightRunners.Lightfield
             string collector = ResolveCollectorPlayerId(other);
             if (string.IsNullOrEmpty(collector))
             {
-                // TODO(track-D): wire IRunnerIdentity on the runner prefab + tag the collider
-                // "Runner". Until then we collect with an unknown id so the match still flows.
+                // Integration: LocalRunnerIdentity MonoBehaviour now exists (Lightfield/LumenGate.cs);
+                // the scene generator (Track G) attaches it to the runner prefab and the spawner
+                // (GameManager/NetworkPlayer) calls SetPlayerId. This warning fires only if the
+                // prefab is missing the component or the spawner hasn't set the id yet.
                 Debug.LogWarning($"[LumenGate] Triggered by {other.name} but no {nameof(IRunnerIdentity)} found; collecting as \"unknown\".");
                 collector = "unknown";
             }

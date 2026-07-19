@@ -341,18 +341,22 @@ namespace LightRunners.Gameplay
             CrashTier tier = CrashTier.NonLeader;
             int dropped = 0;
 
-            // Apply Lumen penalty (Track A's scoreboard extends the interface with a GeoPoint —
-            // we resolve the concrete impl to pass the crash site; otherwise fall back to the
-            // locator interface call without it).
-            if (_scoreboard != null)
-            {
-                tier = _scoreboard.GetCrashTier(playerId);
-                dropped = _scoreboard.ApplyCrashPenalty(playerId, at);
-            }
-            else if (ServiceLocator.TryGet<ILumenScoreboard>(out var sb) && sb != null)
+            // Apply Lumen penalty (decision F). Phase 0.5 widened ILumenScoreboard.ApplyCrashPenalty
+            // to take the crash GeoPoint, so we route uniformly through the interface — the
+            // concrete LumenScoreboard ref is no longer needed to pass the crash site. The
+            // scoreboard stamps the position onto the dropped-Lumen pickup record (decision F).
+            if (ServiceLocator.TryGet<ILumenScoreboard>(out var sb) && sb != null)
             {
                 tier = sb.GetCrashTier(playerId);
-                dropped = sb.ApplyCrashPenalty(playerId);
+                dropped = sb.ApplyCrashPenalty(playerId, at);
+            }
+            else if (_scoreboard != null)
+            {
+                // Defensive fallback: _scoreboard is registered on the locator in Awake, so this
+                // branch should never hit, but keep it so a misconfigured scene still applies the
+                // penalty instead of silently dropping it.
+                tier = _scoreboard.GetCrashTier(playerId);
+                dropped = _scoreboard.ApplyCrashPenalty(playerId, at);
             }
 
             // Closes Track F's crash-metadata gap: full RecordCrash with tier + dropped Lumens,
