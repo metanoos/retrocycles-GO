@@ -1,0 +1,47 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 89f866d5f17f843dc73d3fb9c62019a0, type: 3}
+  m_Name: GameConfig
+  m_EditorClassIdentifier: LightRunners.Core::LightRunners.Core.GameConfig
+  trailPointMinDistance: 0.5
+  gpsSampleInterval: 0.5
+  gpsAccuracyThreshold: 20
+  barometerWeight: 0.7
+  maxTrailPoints: 5000
+  trailWidth: 0.5
+  trailGracePeriod: 2
+  trailGroundOffset: 0.3
+  collisionCheckRadius: 5
+  collisionThreshold: 1.5
+  selfCollisionSkipPoints: 10
+  fusionAppVersion: 1.0
+  maxPlayersPerRoom: 20
+  networkTickRate: 30
+  trailSyncBatchSize: 10
+  supabaseUrl: 
+  supabaseAnonKey: 
+  trailSaveInterval: 5
+  osmTileUserAgent: LightRunners/1.0
+  osmMinimapSize: 200
+  osmDefaultZoom: 16
+  osmMaxConcurrentRequests: 2
+  osmTileRequestInterval: 1
+  osmTileCacheSize: 64
+  defaultLatitude: 37.7749
+  defaultLongitude: -122.4194
+  arTrailRenderDistance: 50
+  arMaxNearbyTrails: 50
+  beaconBaseScale: 1
+  beaconBobAmplitude: 0.1
+  beaconBobFrequency: 2
+  beaconGlowIntensity: 2
+  beaconRotationSpeed: 45

@@ -1,0 +1,18 @@
+{
+    "name": "LightRunners.Backend",
+    "rootNamespace": "LightRunners.Backend",
+    "references": [
+        "LightRunners.Core",
+        "LightRunners.Location",
+        "LightRunners.Trail"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

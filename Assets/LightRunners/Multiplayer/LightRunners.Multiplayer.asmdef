@@ -1,0 +1,19 @@
+{
+    "name": "LightRunners.Multiplayer",
+    "rootNamespace": "LightRunners.Multiplayer",
+    "references": [
+        "LightRunners.Core",
+        "LightRunners.Location",
+        "LightRunners.Trail",
+        "LightRunners.Beacon"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

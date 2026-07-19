@@ -1,0 +1,19 @@
+{
+    "name": "LightRunners.Map",
+    "rootNamespace": "LightRunners.Map",
+    "references": [
+        "LightRunners.Core",
+        "LightRunners.Location",
+        "LightRunners.Trail",
+        "LightRunners.Beacon"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

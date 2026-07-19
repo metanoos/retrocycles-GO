@@ -1,0 +1,17 @@
+{
+    "name": "LightRunners.UI",
+    "rootNamespace": "LightRunners.UI",
+    "references": [
+        "LightRunners.Core",
+        "LightRunners.Beacon"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

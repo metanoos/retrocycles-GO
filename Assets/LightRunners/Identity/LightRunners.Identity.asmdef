@@ -1,0 +1,17 @@
+{
+    "name": "LightRunners.Identity",
+    "rootNamespace": "LightRunners.Identity",
+    "references": [
+        "LightRunners.Core",
+        "LightRunners.Backend"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

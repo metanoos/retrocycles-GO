@@ -1,0 +1,44 @@
+# Unity generated
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# Asset meta (we generate these; ignore only if you prefer to regenerate)
+# *.pidb
+# *.Csproj
+# *.Unityproj
+# *.Sln
+# *.user
+# *.apk
+# *.aab
+# *.unitypackage
+# *.app
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.csproj
+*.sln
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets (spec §17.10 — never commit)
+GameConfig.local.asset
+*.secret.json
+
+# Crashpad / generated analytics
+crashlytics-build.properties
+sysinfo.txt
+.gstack/
+
+# Mono crash dumps (transient, ~350KB each)
+mono_crash.*.json

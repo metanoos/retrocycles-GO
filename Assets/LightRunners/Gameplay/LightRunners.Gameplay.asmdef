@@ -1,0 +1,24 @@
+{
+    "name": "LightRunners.Gameplay",
+    "rootNamespace": "LightRunners.Gameplay",
+    "references": [
+        "LightRunners.Core",
+        "LightRunners.Location",
+        "LightRunners.Trail",
+        "LightRunners.Beacon",
+        "LightRunners.Map",
+        "LightRunners.Backend",
+        "LightRunners.Identity",
+        "UnityEngine.UI",
+        "LightRunners.Multiplayer"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

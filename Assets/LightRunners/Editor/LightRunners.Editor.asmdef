@@ -1,0 +1,26 @@
+{
+    "name": "LightRunners.Editor",
+    "rootNamespace": "LightRunners.Editor",
+    "references": [
+        "LightRunners.Core",
+        "LightRunners.Location",
+        "LightRunners.Trail",
+        "LightRunners.Beacon",
+        "LightRunners.Map",
+        "LightRunners.Backend",
+        "LightRunners.Identity",
+        "LightRunners.Gameplay",
+        "UnityEngine.UI"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

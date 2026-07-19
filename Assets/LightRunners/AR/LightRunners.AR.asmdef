@@ -1,0 +1,30 @@
+{
+    "name": "LightRunners.AR",
+    "rootNamespace": "LightRunners.AR",
+    "references": [
+        "LightRunners.Core",
+        "LightRunners.Location",
+        "LightRunners.Trail",
+        "LightRunners.Beacon",
+        "LightRunners.Backend",
+        "Unity.XR.ARFoundation",
+        "Unity.XR.CoreUtils",
+        "Unity.XR.Management",
+        "Unity.XR.ARSubsystems"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.xr.arfoundation",
+            "expression": "",
+            "define": "UNITY_XR_ARFOUNDATION"
+        }
+    ],
+    "noEngineReferences": false
+}
