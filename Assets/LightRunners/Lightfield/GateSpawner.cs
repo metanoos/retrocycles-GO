@@ -173,11 +173,27 @@ namespace LightRunners.Lightfield
 
         /// <param name="volume">The play volume gates must spawn inside.</param>
         /// <param name="sampler">Spawn position source; null → <see cref="DefaultGatePositionSampler"/>.</param>
-        public GateSpawner(ILightfieldVolume volume, IGatePositionSampler sampler = null)
+        /// <param name="refereeTokenValidator">
+        /// Optional token validator for <see cref="PlaceBonusGate"/> (decision R). Round-1 review
+        /// fix R1-F16/R2-F12: previously <see cref="PlaceBonusGate"/> only checked the token was
+        /// non-empty, and the real <c>RefereeTokenValidator</c> (in Multiplayer) was only invoked
+        /// by <c>RefereeClient</c> — any host-side caller could bypass it by calling
+        /// PlaceBonusGate directly. The validator is now injected at construction so the check is
+        /// unavoidable regardless of caller. Track C's <c>RefereeClient</c> registers the real
+        /// validator when it constructs/registers the GateSpawner; the default is the legacy
+        /// non-empty check for tests and scenes that don't run a referee.
+        /// </param>
+        public GateSpawner(ILightfieldVolume volume, IGatePositionSampler sampler = null,
+            Func<string, bool> refereeTokenValidator = null)
         {
             _volume = volume ?? throw new ArgumentNullException(nameof(volume));
             _sampler = sampler ?? new DefaultGatePositionSampler();
+            _refereeTokenValidator = refereeTokenValidator ?? DefaultTokenCheck;
         }
+
+        private readonly Func<string, bool> _refereeTokenValidator;
+        private static bool DefaultTokenCheck(string token) => !string.IsNullOrEmpty(token);
+
 
         /// <summary>
         /// Decision M: set the active pool size to
@@ -201,18 +217,20 @@ namespace LightRunners.Lightfield
 
         /// <summary>
         /// Decision R — referee-only bonus gate. v2 (full Gate-Director UI) is deferred per
-        /// decision S; the milestone validates only that <paramref name="refereeToken"/> is
-        /// non-empty. Real token validation is <b>Track C's</b> job (<c>RefereeTokenValidator</c>);
-        /// TODO(track-C): wire authoritative referee-token + role check here.
+        /// decision S. Round-1 review fix R1-F16/R2-F12: the token is now validated via the
+        /// injected <c>refereeTokenValidator</c> (constructor arg) rather than a local non-empty
+        /// check, so the validation is unavoidable regardless of caller. Track C's
+        /// <c>RefereeClient</c> injects the real <c>RefereeTokenValidator.Validate</c> when it
+        /// constructs the GateSpawner; tests get the default non-empty check.
         ///
         /// Bonus gates do NOT count toward <see cref="ActiveGateCount"/> and are NOT replaced on
         /// collection (they're one-shot rewards).
         /// </summary>
         public void PlaceBonusGate(GeoPoint at, GatePlacement placement, string refereeToken)
         {
-            if (string.IsNullOrEmpty(refereeToken))
+            if (!_refereeTokenValidator(refereeToken))
             {
-                UnityEngine.Debug.LogWarning("[GateSpawner] PlaceBonusGate rejected: empty referee token. Track C will validate the real token.");
+                UnityEngine.Debug.LogWarning("[GateSpawner] PlaceBonusGate rejected: referee token failed validation.");
                 return;
             }
 

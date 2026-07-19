@@ -104,7 +104,31 @@ namespace LightRunners.Core
         public static void RaiseMatchExpired()
             => MatchExpired?.Invoke();
 
-        // Intentionally not providing an Unsubscribe-all: subscribers must manage their own
-        // lifetimes to avoid silent leaks across scene loads.
+        // Intentionally not providing an Unsubscribe-all for production: subscribers must manage
+        // their own lifetimes to avoid silent leaks across scene loads. The TEST-ONLY helper
+        // below exists so unit tests can isolate themselves from earlier tests' subscriptions.
+#if UNITY_INCLUDE_TESTS
+        /// <summary>
+        /// TEST-ONLY: clear every subscriber from every event. Used by EditMode tests that
+        /// exercise the bus to keep test isolation. Production code MUST NOT call this — it
+        /// would silently detach every legitimate subscriber (Gameplay, Multiplayer, AR, etc.).
+        /// </summary>
+        internal static void ClearSubscribersForTests()
+        {
+            PlayerCrashed = null;
+            GameStateChanged = null;
+            ViewModeChanged = null;
+            ConnectionStateChanged = null;
+            PlayerLevelChanged = null;
+            MatchStateChanged = null;
+            LumensChanged = null;
+            LeaderChanged = null;
+            GateCollected = null;
+            GateSpawned = null;
+            GateDespawned = null;
+            BoundaryViolated = null;
+            MatchExpired = null;
+        }
+#endif
     }
 }

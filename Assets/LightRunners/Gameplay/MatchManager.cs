@@ -450,33 +450,24 @@ namespace LightRunners.Gameplay
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Push finish order + tail radius into the replay package and freeze it. Resolves the
-        /// concrete <c>ReplayPackageSink</c> by interface-name (it lives in LightRunners.Afterglow
-        /// which Gameplay does reference indirectly via Core; we set its public delegate fields
-        /// by reflection so we don't take a hard reference). Safe to call multiple times — the
-        /// sink itself is idempotent.
+        /// Push finish order + tail radius into the replay package and freeze it. Round-1 review
+        /// fix R1-F13: previously resolved the sink via reflection-by-interface-name (fragile — a
+        /// rename would silently null-out the lookup at runtime, not compile time). Gameplay now
+        /// references Afterglow directly, so we use the typed locator and set the sink's public
+        /// fields directly. Safe to call multiple times — the sink itself is idempotent.
         /// </summary>
         private void FinalizeReplayPackage()
         {
-            object sink = ServiceLocator.GetByInterfaceName("LightRunners.Core.IMatchReplaySink");
-            if (sink == null) return;
+            if (_replaySink == null) return;
 
             // Wire the per-player trail-snapshot provider (decision U — closes Track F's gap).
-            // The concrete ReplayPackageSink declares its own delegate types
-            // (TrailSnapshotProviderDelegate / LivePlayerEnumeratorDelegate) which are NOT
-            // assignment-compatible with Func<...>; build matching delegates of the exact field
-            // type so reflection SetValue succeeds.
-            BindDelegate(sink, "TrailSnapshotProvider",
-                typeof(MatchManager).GetMethod(nameof(BuildTrailSnapshot),
-                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance));
-            BindDelegate(sink, "LivePlayerEnumerator",
-                typeof(MatchManager).GetMethod(nameof(LivePlayersForReplay),
-                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance));
+            _replaySink.TrailSnapshotProvider = BuildTrailSnapshot;
+            _replaySink.LivePlayerEnumerator = LivePlayersForReplay;
 
-            // Frozen tail radius (decision T) and finish order are plain fields.
-            SetFieldValue(sink, "FrozenTailRadius", _tailAuthority?.FrozenTailRadius ?? GameConfig.Active.tailRadius);
+            // Frozen tail radius (decision T) and finish order.
+            _replaySink.FrozenTailRadius = _tailAuthority?.FrozenTailRadius ?? GameConfig.Active.tailRadius;
             var order = ComputeFinishOrder();
-            if (order != null) SetFieldValue(sink, "FinishOrder", order);
+            if (order != null) _replaySink.FinishOrder = order;
         }
 
         /// <summary>
@@ -569,9 +560,20 @@ namespace LightRunners.Gameplay
         private IReadOnlyList<string> ComputeFinishOrder()
         {
             if (_scoreboard == null) return null;
-            var players = new List<string>(_knownPlayers);
-            players.Sort((a, b) => _scoreboard.GetLumens(b).CompareTo(_scoreboard.GetLumens(a)));
-            return players;
+            // Round-1 review fix R2-F11 (second half): previously sorted _knownPlayers (a HashSet,
+            // no insertion order) by Lumens alone — ties got an arbitrary order that was then
+            // written into the Afterglow replay's FinishOrder, surfacing as "I tied with my friend
+            // but the replay showed them above me." Now derive from OrderedStandings (deterministic
+            // tiebreak by playerId asc); include only known players for the snapshot.
+            var known = new HashSet<string>(_knownPlayers);
+            var result = new List<string>();
+            foreach ((string pid, int _) in _scoreboard.OrderedStandings)
+                if (known.Contains(pid)) result.Add(pid);
+            // Append any known players not on the scoreboard (zero Lumens, never awarded) in a
+            // deterministic order so the FinishOrder length matches _knownPlayers.
+            foreach (var pid in result) known.Remove(pid);
+            foreach (var pid in known) result.Add(pid);
+            return result;
         }
 
         // ─────────────────────────────────────────────────────────────────────

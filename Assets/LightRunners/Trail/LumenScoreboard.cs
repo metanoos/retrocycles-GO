@@ -156,11 +156,18 @@ namespace LightRunners.Trail
         {
             get
             {
-                // Materialize once so repeated enumeration is safe and consistent.
+                // Round-1 review fix R2-F11: prior impl used List.Sort (introsort, NOT stable)
+                // despite a doc-comment claiming stability, so tied players appeared in
+                // non-deterministic dictionary-enumeration order across runs. Sort primary by
+                // lumens desc with a deterministic tiebreak on playerId asc — stable AND reproducible.
                 var snapshot = new List<(string playerId, int lumens)>(_lumens.Count);
                 foreach (var kvp in _lumens)
                     snapshot.Add((kvp.Key, kvp.Value));
-                snapshot.Sort((a, b) => b.lumens.CompareTo(a.lumens));
+                snapshot.Sort((a, b) =>
+                {
+                    int c = b.lumens.CompareTo(a.lumens);
+                    return c != 0 ? c : string.CompareOrdinal(a.playerId, b.playerId);
+                });
                 return snapshot;
             }
         }
