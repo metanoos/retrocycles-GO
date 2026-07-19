@@ -7,6 +7,7 @@ using LightRunners.Location;
 using LightRunners.Trail;
 using LightRunners.Identity;
 using LightRunners.Backend;
+using LightRunners.Afterglow;
 
 namespace LightRunners.Gameplay
 {
@@ -414,8 +415,12 @@ namespace LightRunners.Gameplay
             if (MatchManager.HasInstance && MatchManager.Instance.State != MatchState.Idle
                 && MatchManager.Instance.State != MatchState.Expired)
             {
+                // Round-2 fix R2-F6: previously this called EndMatch AND FinalizeRun — but
+                // EndMatch drives ExpireMatch which raises MatchExpired, which fires
+                // OnMatchExpired → FinalizeRun synchronously inside the EndMatch call. The
+                // explicit FinalizeRun on the next line was a second call (re-entrancy: double
+                // persist, double summary). Drop it; the MatchExpired bus path drives FinalizeRun.
                 MatchManager.Instance.EndMatch();
-                FinalizeRun(crashed: false, causedBy: null);
                 return;
             }
             FinalizeRun(crashed: false, causedBy: null);
@@ -548,17 +553,75 @@ namespace LightRunners.Gameplay
             // is handled again.
             if (MatchManager.HasInstance && MatchManager.Instance.State == MatchState.Live)
             {
-                GeoPoint at = LocationProvider.HasInstance
-                    ? LocationProvider.Instance.CurrentPosition
-                    : default;
-                MatchManager.Instance.HandlePlayerCrash(
-                    !string.IsNullOrEmpty(causedByPlayerId) ? causedByPlayerId : LocalPlayerId, at);
+                string crashedPlayer = !string.IsNullOrEmpty(causedByPlayerId) ? causedByPlayerId : LocalPlayerId;
+                GeoPoint at = ResolveCrashSite(crashedPlayer);
+                MatchManager.Instance.HandlePlayerCrash(crashedPlayer, at);
                 _crashPipelineFired = false; // allow the next crash event through (post-respawn)
+
+                // Round-2 fix R2-F11: crash FX (ScreenCrashFlash + timeScale slow-mo, spec §16)
+                // were lost in match mode — the in-match branch returned before reaching the
+                // crashSequence.Play call inside FinalizeRun. The crash is no longer terminal
+                // but it should still feel dramatic during respawn. Pitfall #16 still holds:
+                // CrashSequence.OnDestroy restores timeScale=1 unconditionally.
+                try { if (crashSequence != null && TrailManager.HasInstance)
+                    crashSequence.Play(TrailManager.Instance.LocalTrail?.TrailColor ?? Color.cyan); }
+                catch (Exception e) { Debug.LogException(e); }
                 return;
             }
 
             // Non-match (solo) path: crash still terminates the run.
             FinalizeRun(crashed: true, causedBy: causedByPlayerId);
+        }
+
+        /// <summary>
+        /// Resolve the crash site for a player. Round-2 fix R2-F4/R2-F6: the prior impl always
+        /// used the host's LOCAL LocationProvider position, which is wrong for remote-player
+        /// crashes on the host. NetworkPlayer.RpcReportCrash stashes the remote crasher's
+        /// GeoPoint in <c>_reportedCrashSite</c> and exposes it via <c>GetReportedCrashSite()</c>
+        /// — but the host side never read it. Resolve reflectively (NetworkPlayer is
+        /// FUSION_WEAVER-gated; GameManager can't reference the type directly) so we don't take
+        /// an assembly-cycle dependency. Falls back to the local GPS for the local player or
+        /// when no NetworkPlayer matches (solo / Fusion-not-imported).
+        /// </summary>
+        private GeoPoint ResolveCrashSite(string crashedPlayer)
+        {
+            // Look for a NetworkPlayer whose PlayerId matches the crasher and has a reported site.
+            try
+            {
+                var npType = System.Type.GetType("LightRunners.Multiplayer.NetworkPlayer, LightRunners.Multiplayer");
+                if (npType != null)
+                {
+                    // FindObjectsByType<T> via reflection (Unity 2023+ API).
+                    var fogmType = typeof(UnityEngine.Object).GetMethod("FindObjectsByType", System.Type.EmptyTypes);
+                    if (fogmType != null)
+                    {
+                        var method = fogmType.MakeGenericMethod(npType);
+                        var players = method.Invoke(null, new object[0]) as UnityEngine.Object[];
+                        if (players != null)
+                        {
+                            foreach (var p in players)
+                            {
+                                var playerIdProp = npType.GetProperty("PlayerId");
+                                var getSiteMethod = npType.GetMethod("GetReportedCrashSite");
+                                if (playerIdProp != null && getSiteMethod != null)
+                                {
+                                    object pidValue = playerIdProp.GetValue(p);
+                                    string pidString = pidValue?.ToString();
+                                    if (pidString == crashedPlayer)
+                                    {
+                                        var site = getSiteMethod.Invoke(p, null);
+                                        if (site is GeoPoint gp) return gp;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception e) { Debug.LogException(e); }
+
+            // Local player or no NetworkPlayer match → use the local GPS position.
+            return LocationProvider.HasInstance ? LocationProvider.Instance.CurrentPosition : default;
         }
 
         /// <summary>
@@ -574,6 +637,23 @@ namespace LightRunners.Gameplay
         {
             if (MatchManager.HasInstance && MatchManager.Instance.State == MatchState.Expired)
             {
+                // Round-2 fix R2-F9: AfterglowViewController.ShowOverview was never called — the
+                // frozen ReplayPackage was built (sink freezes on MatchExpired) but no component
+                // read it to drive the Overview camera. Decision A/U's "completed trails persist
+                // as neon world art" was unreachable. Show the Overview from the frozen package
+                // before FinalizeRun (which shows the run-summary card).
+                try
+                {
+                    var controller = FindFirstObjectByType<AfterglowViewController>();
+                    if (controller != null
+                        && ServiceLocator.TryGet<IMatchReplaySink>(out var sink)
+                        && sink is ReplayPackageSink concreteSink)
+                    {
+                        controller.ShowOverview(concreteSink.Package);
+                    }
+                }
+                catch (Exception e) { Debug.LogException(e); }
+
                 FinalizeRun(crashed: false, causedBy: null);
             }
         }

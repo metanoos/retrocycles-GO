@@ -793,6 +793,7 @@ as $$
 declare
     v_uid uuid := auth.uid();
     v_caller_uid text;
+    v_caller_is_host boolean := false;
 begin
     if v_uid is null then raise exception 'not_authenticated'; end if;
     v_caller_uid := v_uid::text;
@@ -810,16 +811,15 @@ begin
     -- p_player_id <> v_caller_uid, which let a runner self-write role='host' and then issue
     -- further calls as host — a privilege-escalation chain. The role-lock below is independent
     -- of self-vs-other and closes the hole: only an EXISTING host may write host/referee roles.)
-    declare
-        v_caller_is_host boolean;
-    begin
-        select exists (
-            select 1 from public.match_players h
-            where h.match_id = p_match_id
-              and h.player_id = v_caller_uid
-              and h.role = 'host'
-        ) into v_caller_is_host;
-    end;
+    -- Round-2 fix R2-F4: the prior fix declared v_caller_is_host inside a nested DECLARE block,
+    -- then referenced it after the block ended — a PL/pgSQL scope violation that prevented the
+    -- function from installing. Variable hoisted to the outer declare; nested block removed.
+    select exists (
+        select 1 from public.match_players h
+        where h.match_id = p_match_id
+          and h.player_id = v_caller_uid
+          and h.role = 'host'
+    ) into v_caller_is_host;
 
     -- A non-host may never assign host or referee roles (to anyone, including themselves).
     -- They may only record a 'runner' row.

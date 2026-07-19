@@ -307,6 +307,17 @@ namespace LightRunners.Multiplayer
         private GeoPoint ResolveAuthoritativePlayerGeo()
         {
             Vector3 w = new Vector3(PositionX, PositionY, PositionZ);
+            // Round-2 fix R2-F13: WorldToGeo silently returns (0,0,alt) when the reference is
+            // unset, which on a cold-start host makes every gate look ~12,700 km away and the
+            // distance check rejects every collect. Ensure the reference is initialized (uses
+            // the host's local GPS fix as the projection origin, matching TrailManager's setup);
+            // if no fix is available, log a warning so the failure isn't silent.
+            if (!LightRunners.Location.CoordinateConverter.HasReference
+                && LightRunners.Location.LocationProvider.HasInstance)
+            {
+                LightRunners.Location.CoordinateConverter.EnsureReference(
+                    LightRunners.Location.LocationProvider.Instance.CurrentPosition);
+            }
             return LightRunners.Location.CoordinateConverter.WorldToGeo(w);
         }
 

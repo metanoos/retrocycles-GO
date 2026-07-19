@@ -4,6 +4,8 @@ using UnityEngine;
 using LightRunners.Core;
 using LightRunners.Trail;
 using LightRunners.Afterglow;
+using LightRunners.Lightfield;
+using LightRunners.Location;
 
 namespace LightRunners.Gameplay
 {
@@ -110,6 +112,9 @@ namespace LightRunners.Gameplay
         private LumenScoreboard _scoreboard;
         private TailAuthority _tailAuthority;
         private SnakeTailModel _snakeTailModel;
+        // Track B gate director + lightfield volume — constructed in Awake (Round-2 fix R2-F1).
+        private LightfieldVolume _lightfieldVolume;
+        private GateSpawner _gateDirector;
         // Track F replay sink — constructed in Awake (Round-1 review fix).
         private ReplayPackageSink _replaySink;
 
@@ -118,6 +123,37 @@ namespace LightRunners.Gameplay
         {
             if (_matchStartEpochSeconds < 0) return 0.0;
             return Time.timeAsDouble - _matchStartEpochSeconds;
+        }
+
+        /// <summary>
+        /// Resolve a referee-token validator Func for the GateSpawner (Round-2 fix R2-F8). Returns
+        /// a delegate that calls <c>RefereeTokenValidator.Validate(token, matchId, secret)</c> if
+        /// the Multiplayer assembly + type is reachable; falls back to a non-empty check otherwise.
+        /// Reflective so this call site doesn't depend on FUSION_WEAVER at compile time.
+        /// </summary>
+        private static Func<string, bool> ResolveRefereeTokenValidator()
+        {
+            try
+            {
+                var t = System.Type.GetType("LightRunners.Multiplayer.RefereeTokenValidator, LightRunners.Multiplayer");
+                if (t == null) return null; // GateSpawner substitutes its default non-empty check.
+                var validate = t.GetMethod("Validate", new[] { typeof(string), typeof(string), typeof(string) });
+                if (validate == null) return null;
+                // The validator needs (token, matchId, secret). MatchId is known once a match
+                // starts; secret comes from the host. For the milestone we resolve both lazily on
+                // each call: matchId from the registered IMatchSession if available, secret from a
+                // host-side config field. If secret is unset, fail-closed (return false) so a
+                // misconfigured host can't mint tokens.
+                return token =>
+                {
+                    if (string.IsNullOrEmpty(token)) return false;
+                    string matchId = ServiceLocator.Get<IMatchSession>()?.GetType().GetProperty("MatchId")?.GetValue(ServiceLocator.Get<IMatchSession>()) as string;
+                    string secret = GameConfig.Active.refereeTokenSecret;
+                    if (string.IsNullOrEmpty(secret)) return false; // fail-closed
+                    return (bool)validate.Invoke(null, new object[] { token, matchId ?? string.Empty, secret });
+                };
+            }
+            catch { return null; }
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -134,6 +170,27 @@ namespace LightRunners.Gameplay
             _snakeTailModel = new SnakeTailModel();
             ServiceLocator.Register<ILumenScoreboard>(_scoreboard);
             ServiceLocator.Register<ITailAuthority>(_tailAuthority);
+
+            // Construct & register the real Track B impls (Round-2 review fix R2-F1: previously
+            // MatchManager.Awake registered only LumenScoreboard/TailAuthority/IMatchSession/
+            // IMatchReplaySink — but NOT IGateDirector or ILightfieldVolume. The Null* stubs from
+            // PlatformServiceRegistry remained live, so ConfigureForPlayers and CheckPlayer were
+            // no-ops. The entire gate/Lumen loop was dead in production despite the Round-1 fix
+            // claims. Construct both here and set the Lightfield origin from the local GPS.
+            _lightfieldVolume = new LightfieldVolume();
+            if (LocationProvider.HasInstance)
+                _lightfieldVolume.SetOrigin(LocationProvider.Instance.CurrentPosition);
+            ServiceLocator.Register<ILightfieldVolume>(_lightfieldVolume);
+            // Round-2 fix R2-F8: inject a referee-token validator into the GateSpawner so
+            // PlaceBonusGate validates the token regardless of caller (Round-1 fix added the
+            // ctor param but the production construction site used the default non-empty check).
+            // The validator resolves the host-issued secret from a RefereeTokenValidator
+            // (Multiplayer) — looked up reflectively so Gameplay doesn't take a hard Multiplayer
+            // type dependency at this call site (the asmdef already references Multiplayer for
+            // the gated Fusion blocks; reflective keeps the validator optional at runtime).
+            _gateDirector = new GateSpawner(_lightfieldVolume, refereeTokenValidator: ResolveRefereeTokenValidator());
+            _gateDirector.HookGameEvents();
+            ServiceLocator.Register<IGateDirector>(_gateDirector);
 
             // Construct & register the real Track F replay sink (Round-1 review fix F1: this was
             // never constructed, so the locator kept NullMatchReplaySink and Afterglow was always
@@ -160,6 +217,7 @@ namespace LightRunners.Gameplay
         {
             GameEvents.ConnectionStateChanged -= OnBusConnectionStateChanged;
             GameEvents.GateCollected -= OnBusGateCollected;
+            try { _gateDirector?.UnhookGameEvents(); } catch { /* idempotent */ }
             try { _replaySink?.UnbindFromEventBus(); } catch { /* idempotent */ }
         }
 
@@ -413,6 +471,12 @@ namespace LightRunners.Gameplay
 
         private void OnBusGateCollected(int gateIdValue, string collectorPlayerId)
         {
+            // Round-2 fix R2-F7: guard on Live state. Without this, a stray physics
+            // OnTriggerEnter in the window between ExpireMatch and the gate GameObjects being
+            // destroyed would still mutate the authoritative tally — breaking Decision O's
+            // "most Lumens wins on expiry" invariant.
+            if (State != MatchState.Live) return;
+
             // Round-1 review fix F3/R2-F1: the prior implementation only grew the roster and
             // forwarded to the replay sink — it NEVER called scoreboard.Award, so the Lumen
             // tally stayed at zero forever in any runtime path that didn't go through a Fusion
@@ -430,16 +494,15 @@ namespace LightRunners.Gameplay
                 : (ServiceLocator.Get<ILumenScoreboard>()?.Award(collectorPlayerId) ?? 0);
 
             // Forward to the replay sink with the gate's position when we can resolve it.
-            // Track B's GateSpawner exposes an ActiveGates snapshot; resolve via the concrete
-            // type (Round-1 fix R1-F15: prior code passed default GeoPoint, recording every
-            // Lumen at lat=0/lon=0 in Afterglow). Fall back to default if lookup fails.
+            // Round-1 fix R1-F15: prior code passed default GeoPoint, recording every Lumen at
+            // lat=0/lon=0 in Afterglow. Round-2 fix R2-R1-F1: prior fix used director.ActiveGates
+            // which exists only on the concrete GateSpawner, not the IGateDirector interface —
+            // a compile break. Use TryGetGatePosition (added to the interface in Round 1).
             GeoPoint at = default;
-            if (ServiceLocator.TryGet<IGateDirector>(out var director))
+            if (ServiceLocator.TryGet<IGateDirector>(out var director)
+                && director.TryGetGatePosition(new GateId(gateIdValue), out var gatePos))
             {
-                foreach (var g in director.ActiveGates)
-                {
-                    if (g.Id.Value == gateIdValue) { at = g.Position; break; }
-                }
+                at = gatePos;
             }
             if (ServiceLocator.TryGet<IMatchReplaySink>(out var sink) && sink != null)
                 sink.RecordLumen(collectorPlayerId, at, MatchClockSeconds());

@@ -120,37 +120,27 @@ namespace LightRunners.Multiplayer
 
         /// <summary>
         /// Propagate the host's frozen value into this peer's local
-        /// <see cref="ITailAuthority"/> (resolved via locator). Best-effort: if
-        /// no ITailAuthority is registered (pre-Track-A wiring) the value is
-        /// dropped, which is correct because in that case no tail consumer is
-        /// using the frozen radius yet.
+        /// <see cref="ITailAuthority"/> (resolved via locator) via
+        /// <see cref="ITailAuthority.ApplyNetworkedFreeze"/>. Best-effort: if no ITailAuthority
+        /// is registered (pre-Track-A wiring) the value is dropped, which is correct because in
+        /// that case no tail consumer is using the frozen radius yet.
         ///
-        /// CONTRACT for Track A's TailAuthority (or whoever implements
-        /// ITailAuthority client-side): expose a way to receive a peer-imposed
-        /// frozen value. The simplest contract is "if the local impl is NOT the
-        /// host, freeze at whatever radius the networked prop carries". Track A
-        /// can do that by having its client-side impl call FreezeAtCountdown()
-        /// and then expose FrozenTailRadius as a settable property; we cannot
-        /// set it from here without a new interface method, so the
-        /// recommendation is for Track A's client-side ITailAuthority impl to
-        /// poll this NetworkMatchState (via a new game-side adapter) OR to
-        /// expose a method like <c>ApplyNetworkedFreeze(float)</c> in v2.
-        ///
-        /// For the milestone, we LOG the propagated value so Track A can confirm
-        /// wiring visually; the locator-resolved ITailAuthority call below will
-        /// be a no-op until Track A exposes a setter (FreezeAtCountdown takes no
-        /// args today).
+        /// Round-2 fix R2-F3/R2-F5: the prior doc-comment described ApplyNetworkedFreeze as a v2
+        /// recommendation while the implementation called the parameterless FreezeAtCountdown()
+        /// — leaving clients frozen at their LOCAL config value, not the host's. The interface
+        /// widening landed in Round 1; this call site is now wired to use it.
         /// </summary>
         private void ApplyFrozenRadiusToLocalTailAuthority()
         {
             if (!HasFrozenTailRadius) return;
             if (ServiceLocator.TryGet<ITailAuthority>(out var tail) && tail != null)
             {
-                // FreezeAtCountdown is currently parameter-less; if the local impl
-                // is the host it has already frozen at the right value. If it is a
-                // client impl, Track A should override FreezeAtCountdown to read
-                // the networked prop (via a small adapter that finds this object).
-                tail.FreezeAtCountdown();
+                // Round-2 fix R2-F3/R2-F5: pass the host's authoritative value into the local
+                // authority. Round 1 added ApplyNetworkedFreeze to the interface + impls but
+                // never updated this call site (it was still calling the parameterless
+                // FreezeAtCountdown, so clients froze to their LOCAL config value, not the
+                // host's — producing divergent crash arbitration per decision T).
+                tail.ApplyNetworkedFreeze(FrozenTailRadius);
             }
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
             Debug.Log($"[NetworkMatchState] Client received frozen tail radius = {FrozenTailRadius} m (decision T).");

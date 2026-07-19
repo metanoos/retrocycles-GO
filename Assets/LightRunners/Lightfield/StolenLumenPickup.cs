@@ -170,37 +170,31 @@ namespace LightRunners.Lightfield
     /// scene, and the authoritative <c>StolenLumenQueue</c> on <c>ILumenScoreboard</c> was never
     /// drained. It now implements <see cref="IStolenLumenSpawner"/> and drains the queue directly
     /// (which carries the crash GeoPoint + lifetime) when <see cref="DrainAndSpawn"/> is called
-    /// by <c>MatchManager.HandlePlayerCrash</c>. The LumensChanged heuristic subscription is kept
-    /// as a fallback for any drops that bypass the queue. Decision F, decision S.
+    /// by <c>MatchManager.HandlePlayerCrash</c>. Decision F, decision S.
+    ///
+    /// Round-2 fix R2-F5: the LumensChanged heuristic subscription was DELETED — it caused
+    /// double-spawn (LumenScoreboard.ApplyCrashPenalty both enqueues a record AND fires
+    /// RaiseLumensChanged, so the heuristic fired in addition to DrainAndSpawn). The queue-drain
+    /// path is strictly more correct (it carries the crash GeoPoint; the heuristic used a
+    /// last-known position that was never wired). UpdatePlayerPosition is removed for the same
+    /// reason — its only caller was the heuristic path.
     /// </summary>
     public sealed class StolenLumenPickupSpawner : MonoBehaviour, IStolenLumenSpawner
     {
-        [Tooltip("Track each runner's last known position so we can spawn a pickup at the crash site for drops that arrive via the LumensChanged heuristic path.")]
+        [Tooltip("Enable drain-and-spawn. Disable to drop stolen Lumens silently (debug only).")]
         [SerializeField] private bool _enabled = true;
-
-        private readonly System.Collections.Generic.Dictionary<string, GeoPoint> _lastPositions =
-            new System.Collections.Generic.Dictionary<string, GeoPoint>();
 
         private void OnEnable()
         {
-            GameEvents.LumensChanged += OnLumensChanged;
             // Register self as the IStolenLumenSpawner (overwrites NullStolenLumenSpawner).
             // Round-1 review fix: nothing previously registered the real spawner.
             ServiceLocator.Register<IStolenLumenSpawner>(this);
         }
         private void OnDisable()
         {
-            GameEvents.LumensChanged -= OnLumensChanged;
             // Only unregister if we still own the slot (another instance may have registered).
             if (ServiceLocator.Get<IStolenLumenSpawner>() == this)
                 ServiceLocator.Unregister<IStolenLumenSpawner>();
-        }
-
-        /// <summary>Feed the latest geo position for a runner (called by the position pipeline per tick).</summary>
-        public void UpdatePlayerPosition(string playerId, GeoPoint at)
-        {
-            if (string.IsNullOrEmpty(playerId)) return;
-            _lastPositions[playerId] = at;
         }
 
         /// <summary>
@@ -222,33 +216,5 @@ namespace LightRunners.Lightfield
                 StolenLumenPickup.CreateInstance(record.At, record.PlayerId);
             }
         }
-
-        private void OnLumensChanged(string playerId, int newTotal)
-        {
-            if (!_enabled || string.IsNullOrEmpty(playerId)) return;
-            if (!_lastPositions.TryGetValue(playerId, out var pos))
-            {
-                // Heuristic limitation: no last-known position yet → cannot place a pickup.
-                // The authoritative path (DrainAndSpawn) reads the crash GeoPoint from the queue
-                // and doesn't need this; this is a fallback for any drops that bypass the queue.
-                return;
-            }
-
-            // Negative delta = Lumens dropped (crash penalty per decision F). newTotal is the
-            // authoritative post-drop value; the prior total isn't on this event, so we trigger
-            // a single pickup per negative-delta observation. Documented heuristic: this fires
-            // once per LumensChanged with a decrease, which is the right granularity for crash
-            // penalties (each penalty is a single integer drop).
-            if (newTotal < GetCachedTotal(playerId))
-            {
-                StolenLumenPickup.CreateInstance(pos, playerId);
-            }
-            _totals[playerId] = newTotal;
-        }
-
-        private readonly System.Collections.Generic.Dictionary<string, int> _totals =
-            new System.Collections.Generic.Dictionary<string, int>();
-        private int GetCachedTotal(string playerId)
-            => _totals.TryGetValue(playerId, out var t) ? t : 0;
     }
 }

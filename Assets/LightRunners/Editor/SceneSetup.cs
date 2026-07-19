@@ -331,6 +331,13 @@ namespace LightRunners.Editor
             TryAddType("LightRunners.Lightfield.LightfieldVolume", "LightfieldVolume");
             TryAddType("LightRunners.Lightfield.GateSpawner", "GateSpawner");
 
+            // Round-2 review fix R2-F2: the LumenGateVisualizer (Round-1 fix R2-F2) and
+            // StolenLumenPickupSpawner (Round-1 fix R1-F2) components existed but were never
+            // placed in the scene, so the gate-collection and stolen-Lumen loops were dead code
+            // despite the commit messages claiming they were closed. Mount both here.
+            TryAddType("LightRunners.Lightfield.LumenGateVisualizer", "LumenGateVisualizer");
+            TryAddType("LightRunners.Lightfield.StolenLumenPickupSpawner", "StolenLumenPickupSpawner");
+
             // Afterglow Overview stack (Track F — decisions A/U/T/S).
             BuildAfterglowStack();
 
