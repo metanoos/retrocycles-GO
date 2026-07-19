@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using LightRunners.Core;
@@ -12,6 +13,26 @@ namespace LightRunners.Trail
     ///
     /// Reentrancy guard: a single check can't overlap itself (one frame's query finishes
     /// before another begins).
+    ///
+    /// ─── Lightfield migration (active decisions N + T, 2026-07-18) ────────────
+    /// Decision T (tail geometry): the collision threshold now DERIVES from the authoritative
+    /// tail radius via <see cref="ITailAuthority.FrozenTailRadius"/> × 2 (resolved from the
+    /// <see cref="ServiceLocator"/>). This fixes the v1 bug where <c>collisionThreshold</c> and
+    /// <c>trailWidth</c> were decoupled — a host could set a wide visual ribbon with a narrow
+    /// collision radius and the runner would clip through their own tail. Falls back to
+    /// <see cref="GameConfig.collisionThreshold"/> when no authority is registered (e.g. an editor
+    /// scene that hasn't bootstrapped the match core) so playmode still works.
+    ///
+    /// Decision N (no speed limit + sweep subdivision): there is no movement speed cap. A long
+    /// teleport or fast vehicle move is SUBDIVIDED into ≤ <see cref="GameConfig.sweepSubdivideMaxStepMeters"/>
+    /// sub-segments via <see cref="SubdivideSweep"/> and each is tested independently, so a long
+    /// sweep can't jump PAST a trail between frames. The candidate query radius is expanded by
+    /// half the sweep length (centred on the sweep midpoint) so trails the sweep passes over are
+    /// actually returned by <c>GetTrailSegmentsNear</c>.
+    ///
+    /// Pitfall #1 (self-collision grace direction) is preserved unchanged: the newest N segments
+    /// of the LOCAL player's trail are skipped (shared endpoints with the movement segment) but
+    /// older self-segments are still tested so looping over your own trail crashes you.
     /// </summary>
     public class TrailCollisionDetector : MonoBehaviour
     {
@@ -22,6 +43,11 @@ namespace LightRunners.Trail
         [SerializeField] private bool isFallback = false;
 
         private readonly List<TrailSegment> _candidates = new List<TrailSegment>(64);
+        // Decision N: sub-segments of the current sweep (prev→cur), filled per check.
+        private readonly List<(GeoPoint, GeoPoint)> _sweepBuffer = new List<(GeoPoint, GeoPoint)>(8);
+        // Decision N: candidate segments pre-converted to world space once per check (so each
+        // sub-segment test doesn't re-convert them). (startWorld, endWorld, ownerId).
+        private readonly List<(Vector3, Vector3, string)> _candidateWorldBuffer = new List<(Vector3, Vector3, string)>(64);
         private bool _isChecking;
 
         private double _runStartTimestamp = -1.0;
@@ -48,7 +74,11 @@ namespace LightRunners.Trail
         }
 
         /// <summary>
-        /// Run the check for one movement step. Spec §7.3.
+        /// Run the check for one movement step. Spec §7.3. Decisions N + T (Lightfield migration):
+        /// the near-gate threshold derives from the authoritative tail radius when an
+        /// <see cref="ITailAuthority"/> is registered, and the sweep (prevPos→playerPos) is
+        /// subdivided via <see cref="SubdivideSweep"/> so a long teleport / vehicle move is tested
+        /// segment-by-segment instead of jumping past a trail.
         /// </summary>
         public void CheckCollision(GeoPoint playerPos, GeoPoint prevPos, string localPlayerId)
         {
@@ -63,10 +93,33 @@ namespace LightRunners.Trail
             // collision fires at all — GPS needs a beat to settle, and a noisy first fix can
             // otherwise land the player on top of a trail and kill the run at t=0.
             if (mgr.LocalTrail != null && mgr.RunElapsedSeconds < cfg.trailGracePeriod) return;
+
+            // Decision T: derive the near-gate threshold from the authoritative tail radius.
+            // Falls back to the legacy config threshold when no authority is registered so editor
+            // playmode still works before the match core boots.
+            float thr = ResolveCollisionThreshold();
+
+            // Decision N: subdivide the sweep so a long teleport / fast vehicle move can't skip
+            // over a trail between frames. Each sub-segment is tested independently below.
+            CoordinateConverter.EnsureReference(playerPos);
+            _sweepBuffer.Clear();
+            foreach (var sub in SubdivideSweep(prevPos, playerPos, cfg.sweepSubdivideMaxStepMeters))
+                _sweepBuffer.Add(sub);
+
+            // Expand the candidate query radius to cover the whole sweep: query from the sweep
+            // midpoint with radius = (half the sweep length + collisionCheckRadius + thr slack).
+            // This is what makes a long sweep actually find the trails it passes over.
+            GeoPoint sweepMid = new GeoPoint(
+                (prevPos.latitude + playerPos.latitude) * 0.5,
+                (prevPos.longitude + playerPos.longitude) * 0.5,
+                (prevPos.altitude + playerPos.altitude) * 0.5);
+            double halfSweep = prevPos.HorizontalDistanceTo(playerPos) * 0.5;
+            double queryRadius = cfg.collisionCheckRadius + halfSweep + thr;
+
             _candidates.Clear();
             mgr.GetTrailSegmentsNear(
-                center: playerPos,
-                radius: cfg.collisionCheckRadius,
+                center: sweepMid,
+                radius: queryRadius,
                 excludePlayerId: null, // we want self included (older self-segments crash you)
                 skipRecent: cfg.selfCollisionSkipPoints,
                 results: _candidates);
@@ -74,48 +127,133 @@ namespace LightRunners.Trail
             _isChecking = true;
             try
             {
-                // Convert player movement segment to world (XZ).
-                CoordinateConverter.EnsureReference(playerPos);
-                Vector3 wA = CoordinateConverter.GeoToWorld(prevPos);
-                Vector3 wB = CoordinateConverter.GeoToWorld(playerPos);
-                Vector2 pA = new Vector2(wA.x, wA.z);
-                Vector2 pB = new Vector2(wB.x, wB.z);
-
-                float thr = cfg.collisionThreshold;
-                float thr2 = thr * 2f;
-
+                // Pre-convert candidate segments to world space once (independent of sub-segment).
+                _candidateWorldBuffer.Clear();
                 foreach (var seg in _candidates)
                 {
                     Vector3 sAw = CoordinateConverter.GeoToWorld(seg.Start);
                     Vector3 sBw = CoordinateConverter.GeoToWorld(seg.End);
-                    Vector2 sA = new Vector2(sAw.x, sAw.z);
-                    Vector2 sB = new Vector2(sBw.x, sBw.z);
+                    _candidateWorldBuffer.Add((sAw, sBw, seg.OwnerId));
+                }
 
-                    // 2D segment intersection on XZ plane (spec §7.3).
-                    bool intersect = SegmentsIntersect2D(pA, pB, sA, sB);
-                    // Distance gate (catches near-misses / coincident points).
-                    double d1 = PointToSegmentDistance(pA, sA, sB);
-                    double d2 = PointToSegmentDistance(pB, sA, sB);
-                    bool near = (d1 < thr) || (d2 < thr) || intersect;
+                float thr2 = thr * 2f;
 
-                    if (!near) continue;
+                // Test each sub-segment of the sweep against every candidate. One hit is enough.
+                foreach (var sub in _sweepBuffer)
+                {
+                    Vector3 wA = CoordinateConverter.GeoToWorld(sub.Item1);
+                    Vector3 wB = CoordinateConverter.GeoToWorld(sub.Item2);
+                    Vector2 pA = new Vector2(wA.x, wA.z);
+                    Vector2 pB = new Vector2(wB.x, wB.z);
+                    float minPlayerY = Mathf.Min(wA.y, wB.y);
 
-                    // Height gate: trails live on a band; ignore segments too far above/below.
-                    float minSegY = Mathf.Min(sAw.y, sBw.y);
-                    float maxSegY = Mathf.Max(sAw.y, sBw.y);
-                    float playerY = Mathf.Min(wA.y, wB.y);
-                    float dy = Mathf.Max(0f, minSegY - playerY, playerY - maxSegY);
-                    if (dy > thr2) continue;
+                    foreach (var cw in _candidateWorldBuffer)
+                    {
+                        Vector2 sA = new Vector2(cw.Item1.x, cw.Item1.z);
+                        Vector2 sB = new Vector2(cw.Item2.x, cw.Item2.z);
 
-                    // Local player crossing their own older trail is also a crash — that's the
-                    // skip direction invariant (pitfall #1). Don't filter by ownerId == localPlayerId.
-                    OnCollisionDetected?.Invoke(seg.OwnerId);
-                    return; // one crash is enough
+                        // 2D segment intersection on XZ plane (spec §7.3).
+                        bool intersect = SegmentsIntersect2D(pA, pB, sA, sB);
+                        // Distance gate (catches near-misses / coincident points).
+                        double d1 = PointToSegmentDistance(pA, sA, sB);
+                        double d2 = PointToSegmentDistance(pB, sA, sB);
+                        bool near = (d1 < thr) || (d2 < thr) || intersect;
+
+                        if (!near) continue;
+
+                        // Height gate: trails live on a band; ignore segments too far above/below.
+                        float minSegY = Mathf.Min(cw.Item1.y, cw.Item2.y);
+                        float maxSegY = Mathf.Max(cw.Item1.y, cw.Item2.y);
+                        float dy = Mathf.Max(0f, minSegY - minPlayerY, minPlayerY - maxSegY);
+                        if (dy > thr2) continue;
+
+                        // Local player crossing their own older trail is also a crash — that's the
+                        // skip direction invariant (pitfall #1). Don't filter by ownerId == localPlayerId.
+                        OnCollisionDetected?.Invoke(cw.Item3);
+                        return; // one crash is enough
+                    }
                 }
             }
             finally
             {
                 _isChecking = false;
+            }
+        }
+
+        /// <summary>
+        /// Resolve the near-gate threshold (decision T). Uses the authoritative tail radius
+        /// (<c>FrozenTailRadius × 2</c>) when an <see cref="ITailAuthority"/> is registered on the
+        /// <see cref="ServiceLocator"/>; otherwise falls back to
+        /// <see cref="GameConfig.collisionThreshold"/>. The ×2 covers the symmetric near-test
+        /// (head radius + tail radius; we model the head as a point so head touches tail when
+        /// their combined radii overlap, which for a unit-radius head is ≈ tail radius × 2).
+        /// </summary>
+        private static float ResolveCollisionThreshold()
+        {
+            if (ServiceLocator.TryGet<ITailAuthority>(out var authority) && authority != null)
+            {
+                float r = authority.FrozenTailRadius;
+                if (r > 0f) return r * 2f;
+            }
+            return GameConfig.Active.collisionThreshold;
+        }
+
+        /// <summary>
+        /// Subdivide a movement sweep (decision N) into sub-segments each no longer than
+        /// <paramref name="maxStepMeters"/>. Returns pairs of <see cref="GeoPoint"/>s; the
+        /// concatenation traces prev→cur. Yields the original (prev, cur) pair as a single result
+        /// when the sweep is short or when <paramref name="maxStepMeters"/> is non-positive.
+        ///
+        /// Invariant (test-backed): the total horizontal length of the subdivided chain ≈ the
+        /// original sweep length, within one sub-segment's worth of equirectangular round-trip
+        /// error (sub-millimetre at city scale). This is the property that makes a long teleport
+        /// safe — every metre of the sweep is actually tested.
+        ///
+        /// Pure static — no MonoBehaviour state touched — so it is unit-testable in isolation
+        /// (see SweepSubdivisionTests).
+        /// </summary>
+        public static IEnumerable<(GeoPoint, GeoPoint)> SubdivideSweep(GeoPoint prev, GeoPoint cur, float maxStepMeters)
+        {
+            if (maxStepMeters <= 0f)
+            {
+                yield return (prev, cur);
+                yield break;
+            }
+
+            double total = prev.HorizontalDistanceTo(cur);
+            if (total <= maxStepMeters)
+            {
+                yield return (prev, cur);
+                yield break;
+            }
+
+            // Number of sub-segments (each ≤ maxStepMeters). Use ceil so the last step is the
+            // remainder, never over the cap. The interpolation is done in the equirectangular
+            // local-metre space (consistent with CoordinateConverter's planar approximation), so
+            // sub-segments are straight in World space — same as a single long segment would be.
+            int steps = (int)Math.Ceiling(total / maxStepMeters);
+            if (steps < 1) steps = 1;
+
+            // Local planar basis around `prev` (equirectangular; matches CoordinateConverter).
+            const double EarthR = GeoPoint.EarthRadiusMeters;
+            double metersPerDegLat = Math.PI * EarthR / 180.0;
+            double cosLat = Math.Cos(prev.latitude * Math.PI / 180.0);
+            double metersPerDegLon = metersPerDegLat * cosLat;
+
+            double dLatTotal = cur.latitude - prev.latitude;
+            double dLonTotal = cur.longitude - prev.longitude;
+            double dAltTotal = cur.altitude - prev.altitude;
+
+            GeoPoint a = prev;
+            for (int i = 1; i <= steps; i++)
+            {
+                double t = (double)i / steps;
+                GeoPoint b = new GeoPoint(
+                    prev.latitude + dLatTotal * t,
+                    prev.longitude + dLonTotal * t,
+                    prev.altitude + dAltTotal * t);
+                yield return (a, b);
+                a = b;
             }
         }
 
