@@ -163,10 +163,16 @@ namespace LightRunners.Afterglow
 
         /// <summary>
         /// Authoritative tail radius frozen at countdown (decision T). Width used by the
-        /// Overview's neon line strips = <c>FrozenTailRadius × 2</c>. Default 0.5 m until
+        /// Overview's neon line strips = <c>FrozenTailRadius × 2</c>. Default 2.0 m until
         /// the sink receives the host value.
         /// </summary>
-        public float FrozenTailRadius = 0.5f;
+        public float FrozenTailRadius = FrozenMatchConfig.Default.TailRadiusMeters;
+
+        /// <summary>Locked player collision radius persisted for restore/migration validation.</summary>
+        public int FrozenPlayerHeadRadiusCm = FrozenMatchConfig.PlayerHeadRadiusCm;
+
+        /// <summary>Stable hash of the exact frozen collision and clearance contract.</summary>
+        public uint FrozenConfigHash = FrozenMatchConfig.Default.Hash;
 
         /// <summary>One final trail per player, captured at match expiry.</summary>
         public List<TrailCapture> Trails = new List<TrailCapture>();
@@ -244,6 +250,26 @@ namespace LightRunners.Afterglow
         {
             if (IsFrozen) throw Ex();
             FrozenTailRadius = radius > 0f ? radius : FrozenTailRadius;
+        }
+
+        public void SetFrozenMatchConfig(FrozenMatchConfig config)
+        {
+            if (IsFrozen) throw Ex();
+            FrozenTailRadius = config.TailRadiusMeters;
+            FrozenPlayerHeadRadiusCm = FrozenMatchConfig.PlayerHeadRadiusCm;
+            FrozenConfigHash = config.Hash;
+        }
+
+        /// <summary>Validate that a loaded replay still matches its recorded frozen rules.</summary>
+        public bool TryGetFrozenMatchConfig(out FrozenMatchConfig config, out string error)
+        {
+            int tailRadiusCm = (int)Math.Round(FrozenTailRadius * 100.0, MidpointRounding.AwayFromZero);
+            return FrozenMatchConfig.TryRestore(
+                tailRadiusCm,
+                FrozenPlayerHeadRadiusCm,
+                FrozenConfigHash,
+                out config,
+                out error);
         }
 
         public void SetMatchEndTime(DateTime endUtc)

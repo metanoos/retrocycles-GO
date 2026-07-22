@@ -85,9 +85,9 @@ namespace LightRunners.Afterglow.Tests
         public void Freeze_FillsMissingEndTime()
         {
             var pkg = new ReplayPackage();
-            Assert.AreEqual(default, pkg.MatchEndTimeUtc);
+            Assert.AreEqual(default(DateTime), pkg.MatchEndTimeUtc);
             pkg.Freeze();
-            Assert.AreNotEqual(default, pkg.MatchEndTimeUtc,
+            Assert.AreNotEqual(default(DateTime), pkg.MatchEndTimeUtc,
                 "Freeze must default MatchEndTimeUtc to now if unset");
         }
 
@@ -192,6 +192,21 @@ namespace LightRunners.Afterglow.Tests
             Assert.AreEqual(1, pkg.Lumens.Count);
             Assert.AreEqual(1, pkg.Crashes.Count);
             Assert.AreEqual(1, pkg.Crashes[0].LumensDropped);
+        }
+
+        [Test]
+        public void FrozenMatchConfig_RoundTripsAndRejectsTampering()
+        {
+            var package = new ReplayPackage();
+            Assert.IsTrue(FrozenMatchConfig.TryCreate(300, 200, out var frozen, out string createError), createError);
+
+            package.SetFrozenMatchConfig(frozen);
+
+            Assert.IsTrue(package.TryGetFrozenMatchConfig(out var restored, out string restoreError), restoreError);
+            Assert.AreEqual(frozen, restored);
+            package.FrozenPlayerHeadRadiusCm = 250;
+            Assert.IsFalse(package.TryGetFrozenMatchConfig(out _, out string tamperError));
+            StringAssert.Contains("locked at 200 cm", tamperError);
         }
 
         [Test]

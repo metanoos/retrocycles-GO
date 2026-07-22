@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using NUnit.Framework;
 using UnityEngine;
+using UnityEngine.TestTools;
 using LightRunners.Core;
 using LightRunners.Gameplay;
 using LightRunners.Trail;
@@ -30,8 +31,20 @@ namespace LightRunners.Gameplay.Tests
             ServiceLocator.Clear();
             _host = new GameObject("MatchManagerHost");
             _match = _host.AddComponent<MatchManager>();
+            // EditMode does not automatically invoke MonoBehaviour.Awake. Exercise the same
+            // initialization path the Game scene uses before asserting locator registration.
+            if (!ServiceLocator.IsRegistered<ITailAuthority>())
+            {
+                var awake = typeof(MatchManager).GetMethod(
+                    "Awake",
+                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                Assert.IsNotNull(awake);
+                awake.Invoke(_match, null);
+            }
             // MatchManager.Awake registers ILumenScoreboard + ITailAuthority; read the tail back.
-            Assert.IsTrue(ServiceLocator.TryGet<ITailAuthority>(out _tail), "TailAuthority should be registered by MatchManager.Awake");
+            Assert.IsTrue(ServiceLocator.TryGet<ITailAuthority>(out var tail), "TailAuthority should be registered by MatchManager.Awake");
+            _tail = tail as TailAuthority;
+            Assert.IsNotNull(_tail, "MatchManager should register the concrete TailAuthority");
             _tail.Unfreeze();
 
             _transitions.Clear();
@@ -90,6 +103,26 @@ namespace LightRunners.Gameplay.Tests
             _match.BeginMatch();
             Assert.AreEqual(MatchState.Countdown, _match.State);
             Assert.IsTrue(_tail.IsFrozen, "Tail should freeze as part of entering Countdown");
+        }
+
+        [Test]
+        public void BeginMatch_InvalidTailConfig_StaysInWarmup()
+        {
+            float original = GameConfig.Active.tailRadius;
+            try
+            {
+                GameConfig.Active.tailRadius = 1.75f;
+                LogAssert.Expect(LogType.Error, new System.Text.RegularExpressions.Regex("Cannot begin match:.*Tail radius"));
+
+                _match.BeginMatch();
+
+                Assert.AreEqual(MatchState.Idle, _match.State, "invalid config remains retryable");
+                Assert.IsFalse(_tail.IsFrozen);
+            }
+            finally
+            {
+                GameConfig.Active.tailRadius = original;
+            }
         }
 
         [Test]

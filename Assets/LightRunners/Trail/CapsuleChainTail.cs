@@ -128,17 +128,17 @@ namespace LightRunners.Trail
         /// Does <paramref name="head"/> (with radius <paramref name="headRadius"/>) overlap any
         /// capsule in <paramref name="chain"/>? Returns the first hit (or a default with
         /// <c>OwnerId == null</c>). This is the reference collision test for the capsule model;
-        /// <see cref="TrailCollisionDetector"/> keeps its own (faster, 2D) path for live play, but
-        /// this is the geometric truth both must agree on.
+        /// <see cref="TrailCollisionDetector"/> uses the equivalent continuous swept-segment test
+        /// for live play, so both paths share the same inclusive contact boundary.
         /// </summary>
         public static bool OverlapsAny(Vector3 head, float headRadius, IReadOnlyList<Capsule> chain, out Capsule hit)
         {
-            float rr = headRadius;
+            float rr = Math.Max(0f, headRadius);
             for (int i = 0; i < chain.Count; i++)
             {
                 var c = chain[i];
                 double d = c.DistanceToSpine(head);
-                if (d < c.Radius + rr)
+                if (d <= c.Radius + rr)
                 {
                     hit = c;
                     return true;

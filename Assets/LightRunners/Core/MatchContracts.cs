@@ -226,9 +226,15 @@ namespace LightRunners.Core
     {
         /// <summary>Selected tail radius (m). Returns the host value once frozen, else the config default.</summary>
         float FrozenTailRadius { get; }
+        /// <summary>Validated collision and clearance values derived from the selected tail and fixed 2 m player radius.</summary>
+        FrozenMatchConfig FrozenConfig { get; }
         bool IsFrozen { get; }
         /// <summary>Host-only: freeze the radius at its current value. No-op once frozen.</summary>
         void FreezeAtCountdown();
+        /// <summary>Validate and freeze the local host config. Invalid settings leave the authority unfrozen.</summary>
+        bool TryFreezeAtCountdown(out string error);
+        /// <summary>Apply and verify the host's integer config on a joining/restoring client.</summary>
+        bool TryApplyNetworkedFreeze(int tailRadiusCm, uint configHash, out string error);
         /// <summary>Reset to unfrozen (called between matches).</summary>
         void Unfreeze();
     }

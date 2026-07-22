@@ -80,13 +80,13 @@ namespace LightRunners.Core
 
         [Header("Lightfield Match — active decisions 2026-07-18")]
         [Tooltip("Decimal gate-to-player density. activeGateCount = max(1, ceil(playerCount × this)). Decision M, default 0.5.")]
-        [Range(0f, 4f)] public float gatesPerPlayer = 0.5f;
+        [Range(0.25f, 1f)] public float gatesPerPlayer = 0.5f;
         [Tooltip("Lumen Gate collection trigger radius (m). Decision G — host-tunable.")]
-        [Min(0.1f)] public float gateCollectionRadius = 2.0f;
-        [Tooltip("Authoritative tail radius (m). Frozen at countdown (decision T); all head-to-trail collision derives from this.")]
-        [Min(0.05f)] public float tailRadius = 0.5f;
+        [Range(3f, 20f)] public float gateCollectionRadius = 10.0f;
+        [Tooltip("Authoritative cylindrical tail radius (m). Legal host values are 1.5–4.0 m in 0.5 m steps; frozen at countdown. Player collision radius is locked at 2.0 m.")]
+        [Range(1.5f, 4.0f)] public float tailRadius = 2.0f;
         [Tooltip("Match clock (s). Host-tunable; default 6 minutes. Decision O.")]
-        [Min(10f)] public float matchDurationSeconds = 360f;
+        [Range(180f, 600f)] public float matchDurationSeconds = 360f;
         [Tooltip("Pre-live countdown (s). Tail radius freezes on entry to Countdown (decision T).")]
         [Min(1f)] public float matchCountdownSeconds = 3f;
         [Tooltip("Lumens dropped by a non-leader on crash. Decision F.")]
@@ -98,11 +98,11 @@ namespace LightRunners.Core
         [Tooltip("Grace after run start during which a runner's own trail cannot kill it (decision D). Extends trailGracePeriod.")]
         [Min(0f)] public float emergenceGraceSeconds = 2f;
         [Tooltip("Ground-disc radius of the Lightfield (m). Decision K — ground-only milestone; full dome deferred (decision S).")]
-        [Min(5f)] public float lightfieldBaseRadiusMeters = 50f;
+        [Range(30f, 150f)] public float lightfieldBaseRadiusMeters = 120f;
         [Tooltip("Hard altitude ceiling stub for the dome (m). Decision K — aerial milestone (decision S) replaces with true hemisphere.")]
         [Min(1f)] public float lightfieldDomeCeilingMeters = 6f;
-        [Tooltip("Max single-segment length (m) for collision sweep subdivision. Decision N — long teleports/vehicle moves are tested segment-by-segment.")]
-        [Min(0.5f)] public float sweepSubdivideMaxStepMeters = 2f;
+        [Tooltip("Legacy inspector mirror of the locked 4 m collision microsegment. Live match collision uses FrozenMatchConfig.CollisionMicrosegmentMeters.")]
+        [Min(0.5f)] public float sweepSubdivideMaxStepMeters = 4f;
 
         /// <summary>Cached lazy load of <c>Resources/GameConfig.asset</c>.</summary>
         private static GameConfig _cached;

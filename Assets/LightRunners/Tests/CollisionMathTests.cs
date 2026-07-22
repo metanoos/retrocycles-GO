@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using NUnit.Framework;
 using UnityEngine;
 using LightRunners.Trail;
@@ -70,6 +71,53 @@ namespace LightRunners.Tests
             double dHit = TrailCollisionDetector.PointToSegmentDistance(
                 new Vector2(5, 1.49f), new Vector2(0, 0), new Vector2(10, 0));
             Assert.Less(dHit, 1.5);
+        }
+
+        [Test]
+        public void SegmentDistance_Crossing3D_IsZero()
+        {
+            double distance = TrailCollisionDetector.SegmentToSegmentDistance(
+                new Vector3(-5f, 0f, 0f), new Vector3(5f, 0f, 0f),
+                new Vector3(0f, -5f, 0f), new Vector3(0f, 5f, 0f));
+            Assert.AreEqual(0.0, distance, 1e-5);
+        }
+
+        [Test]
+        public void SegmentDistance_ParallelAtAltitude_UsesTrue3DDistance()
+        {
+            double distance = TrailCollisionDetector.SegmentToSegmentDistance(
+                new Vector3(0f, 5f, 0f), new Vector3(10f, 5f, 0f),
+                new Vector3(0f, 0f, 0f), new Vector3(10f, 0f, 0f));
+            Assert.AreEqual(5.0, distance, 1e-5);
+        }
+
+        [Test]
+        public void SegmentDistance_DegenerateSegments_UsePointDistance()
+        {
+            double distance = TrailCollisionDetector.SegmentToSegmentDistance(
+                new Vector3(0f, 0f, 0f), new Vector3(0f, 0f, 0f),
+                new Vector3(0f, 3f, 4f), new Vector3(0f, 3f, 4f));
+            Assert.AreEqual(5.0, distance, 1e-5);
+        }
+
+        [Test]
+        public void CapsuleContact_ExactCombinedRadius_CountsAsCollision()
+        {
+            var chain = new List<CapsuleChainTail.Capsule>
+            {
+                new CapsuleChainTail.Capsule(
+                    new Vector3(0f, 0f, 0f),
+                    new Vector3(10f, 0f, 0f),
+                    radius: 2f,
+                    ownerId: "tail")
+            };
+
+            Assert.IsTrue(CapsuleChainTail.OverlapsAny(
+                new Vector3(5f, 4f, 0f),
+                headRadius: 2f,
+                chain,
+                out var hit));
+            Assert.AreEqual("tail", hit.OwnerId);
         }
     }
 }

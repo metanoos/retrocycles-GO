@@ -82,13 +82,24 @@ namespace LightRunners.Core
     }
 
     /// <summary>
-    /// No-op <see cref="ITailAuthority"/>: tail radius is the fallback 0.5m, never frozen.
+    /// No-op <see cref="ITailAuthority"/>: exposes the locked defaults but never freezes.
     /// </summary>
     public sealed class NullTailAuthority : ITailAuthority
     {
-        public float FrozenTailRadius => 0.5f;
+        public float FrozenTailRadius => FrozenMatchConfig.Default.TailRadiusMeters;
+        public FrozenMatchConfig FrozenConfig => FrozenMatchConfig.Default;
         public bool IsFrozen => false;
         public void FreezeAtCountdown() { }
+        public bool TryFreezeAtCountdown(out string error)
+        {
+            error = "No tail authority is available.";
+            return false;
+        }
+        public bool TryApplyNetworkedFreeze(int tailRadiusCm, uint configHash, out string error)
+        {
+            error = "No tail authority is available.";
+            return false;
+        }
         public void Unfreeze() { }
     }
 }

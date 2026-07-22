@@ -100,9 +100,9 @@ CLI: `Unity -batchmode -projectPath . -runTests -testPlatform EditMode -testResu
 | Supabase URL configured | WARN | Blank OK for phase 4 |
 | URP pipeline / AR Foundation / Fusion / custom shaders (3/3) | WARN | Each degrades gracefully |
 | **GameConfig.gatesPerPlayer > 0** | WARN | Decision M (Lightfield) |
-| **GameConfig.tailRadius ≥ 0.05** | WARN | Decision T |
-| **GameConfig.matchDurationSeconds ≥ 10** | WARN | Decision O |
-| **GameConfig.gateCollectionRadius ≥ 0.1** | WARN | Decision G |
+| **GameConfig.tailRadius = 1.5–4.0 m in 0.5 m steps** | WARN | Decision T; player collision radius is fixed at 2 m |
+| **GameConfig.matchDurationSeconds = 3–10 whole minutes** | WARN | Decision O |
+| **GameConfig.gateCollectionRadius = 3–20 m and ≤ 20% of field** | WARN | Decision G |
 | **Resources/Gates/LumenGate.prefab** | WARN | Run *Setup → Gate Prefabs* |
 | **Resources/Gates/StolenLumenPickup.prefab** | WARN | Run *Setup → Gate Prefabs* |
 | **LightRunners.Lightfield** assembly present | WARN | Track B |

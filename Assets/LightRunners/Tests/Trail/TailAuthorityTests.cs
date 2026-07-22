@@ -26,12 +26,12 @@ namespace LightRunners.Trail.Tests
         [Test]
         public void FrozenTailRadius_PreFreeze_ReturnsLiveConfigValue()
         {
-            var cfg = SetCachedConfig(tailRadius: 0.75f);
+            var cfg = SetCachedConfig(tailRadius: 2.0f);
             try
             {
                 var auth = new TailAuthority();
                 Assert.IsFalse(auth.IsFrozen);
-                Assert.AreEqual(0.75f, auth.FrozenTailRadius, 1e-4f,
+                Assert.AreEqual(2.0f, auth.FrozenTailRadius, 1e-4f,
                     "pre-freeze: returns the live config value");
             }
             finally { RestoreConfig(cfg); }
@@ -40,13 +40,13 @@ namespace LightRunners.Trail.Tests
         [Test]
         public void FreezeAtCountdown_SnapshotsConfigValue()
         {
-            var cfg = SetCachedConfig(tailRadius: 1.25f);
+            var cfg = SetCachedConfig(tailRadius: 2.5f);
             try
             {
                 var auth = new TailAuthority();
-                auth.FreezeAtCountdown();
+                Assert.IsTrue(auth.TryFreezeAtCountdown(out string error), error);
                 Assert.IsTrue(auth.IsFrozen);
-                Assert.AreEqual(1.25f, auth.FrozenTailRadius, 1e-4f,
+                Assert.AreEqual(2.5f, auth.FrozenTailRadius, 1e-4f,
                     "frozen value = config value at the moment of freezing");
             }
             finally { RestoreConfig(cfg); }
@@ -60,18 +60,18 @@ namespace LightRunners.Trail.Tests
         [Test]
         public void FrozenTailRadius_PostFreeze_ConfigChangeDoesNotAlter()
         {
-            var cfg = SetCachedConfig(tailRadius: 0.9f);
+            var cfg = SetCachedConfig(tailRadius: 1.5f);
             try
             {
                 var auth = new TailAuthority();
                 auth.FreezeAtCountdown();
-                Assert.AreEqual(0.9f, auth.FrozenTailRadius, 1e-4f);
+                Assert.AreEqual(1.5f, auth.FrozenTailRadius, 1e-4f);
 
                 // Now mutate the config — the frozen authority must NOT pick up the change.
                 MutateCachedConfig(tailRadius: 5.0f);
 
                 Assert.IsTrue(auth.IsFrozen, "still frozen");
-                Assert.AreEqual(0.9f, auth.FrozenTailRadius, 1e-4f,
+                Assert.AreEqual(1.5f, auth.FrozenTailRadius, 1e-4f,
                     "post-freeze config changes must not alter the authoritative radius");
             }
             finally { RestoreConfig(cfg); }
@@ -80,7 +80,7 @@ namespace LightRunners.Trail.Tests
         [Test]
         public void FreezeAtCountdown_Twice_FirstFreezeWins()
         {
-            var cfg = SetCachedConfig(tailRadius: 0.6f);
+            var cfg = SetCachedConfig(tailRadius: 1.5f);
             try
             {
                 var auth = new TailAuthority();
@@ -88,7 +88,7 @@ namespace LightRunners.Trail.Tests
                 MutateCachedConfig(tailRadius: 3.0f);
                 auth.FreezeAtCountdown(); // no-op — re-freeze mid-match is forbidden (decision T)
 
-                Assert.AreEqual(0.6f, auth.FrozenTailRadius, 1e-4f,
+                Assert.AreEqual(1.5f, auth.FrozenTailRadius, 1e-4f,
                     "first freeze wins; a re-freeze can't change the rules mid-match");
             }
             finally { RestoreConfig(cfg); }
@@ -97,7 +97,7 @@ namespace LightRunners.Trail.Tests
         [Test]
         public void Unfreeze_ResetsToLiveConfigValue()
         {
-            var cfg = SetCachedConfig(tailRadius: 0.8f);
+            var cfg = SetCachedConfig(tailRadius: 2.5f);
             try
             {
                 var auth = new TailAuthority();
@@ -107,7 +107,7 @@ namespace LightRunners.Trail.Tests
                 auth.Unfreeze();
 
                 Assert.IsFalse(auth.IsFrozen, "unfrozen");
-                Assert.AreEqual(0.8f, auth.FrozenTailRadius, 1e-4f,
+                Assert.AreEqual(2.5f, auth.FrozenTailRadius, 1e-4f,
                     "after unfreeze, returns to live config value again");
             }
             finally { RestoreConfig(cfg); }
@@ -116,21 +116,53 @@ namespace LightRunners.Trail.Tests
         [Test]
         public void Unfreeze_AllowsRefreezeWithNewConfig()
         {
-            var cfg = SetCachedConfig(tailRadius: 0.5f);
+            var cfg = SetCachedConfig(tailRadius: 1.5f);
             try
             {
                 var auth = new TailAuthority();
                 auth.FreezeAtCountdown();
-                Assert.AreEqual(0.5f, auth.FrozenTailRadius, 1e-4f);
+                Assert.AreEqual(1.5f, auth.FrozenTailRadius, 1e-4f);
 
                 auth.Unfreeze();
-                MutateCachedConfig(tailRadius: 1.0f);
+                MutateCachedConfig(tailRadius: 3.0f);
                 auth.FreezeAtCountdown(); // a NEW match re-freezes fresh
 
-                Assert.AreEqual(1.0f, auth.FrozenTailRadius, 1e-4f,
+                Assert.AreEqual(3.0f, auth.FrozenTailRadius, 1e-4f,
                     "between matches, Unfreeze lets the next countdown freeze a fresh value");
             }
             finally { RestoreConfig(cfg); }
+        }
+
+        [TestCase(1.0f)]
+        [TestCase(1.75f)]
+        [TestCase(4.5f)]
+        public void TryFreezeAtCountdown_RejectsIllegalTailRadius(float illegalRadius)
+        {
+            var cfg = SetCachedConfig(illegalRadius);
+            try
+            {
+                var auth = new TailAuthority();
+                Assert.IsFalse(auth.TryFreezeAtCountdown(out string error));
+                Assert.IsFalse(auth.IsFrozen);
+                StringAssert.Contains("Tail radius", error);
+            }
+            finally { RestoreConfig(cfg); }
+        }
+
+        [Test]
+        public void NetworkedFreeze_VerifiesHashAndAppliesHostValue()
+        {
+            Assert.IsTrue(FrozenMatchConfig.TryCreate(350, 200, out var hostConfig, out string createError), createError);
+            var auth = new TailAuthority();
+
+            Assert.IsTrue(auth.TryApplyNetworkedFreeze(350, hostConfig.Hash, out string applyError), applyError);
+            Assert.IsTrue(auth.IsFrozen);
+            Assert.AreEqual(3.5f, auth.FrozenTailRadius, 1e-4f);
+            Assert.AreEqual(5.5f, auth.FrozenConfig.HeadToTrailCollisionMeters, 1e-4f);
+
+            auth.Unfreeze();
+            Assert.IsFalse(auth.TryApplyNetworkedFreeze(350, hostConfig.Hash + 1u, out string hashError));
+            StringAssert.Contains("hash mismatch", hashError.ToLowerInvariant());
         }
 
         // ─────────────────────────────────────────────────────────────────────

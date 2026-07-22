@@ -27,9 +27,20 @@ MonoBehaviour:
   maxPlayersPerRoom: 20
   networkTickRate: 30
   trailSyncBatchSize: 10
+  connectTimeoutSeconds: 8
+  roomJoinRetryLimit: 3
+  lobbyCodeLength: 6
+  lobbyMaxMembers: 8
+  lobbyCodeAlphabet: ABCDEFGHJKLMNPQRSTUVWXYZ23456789
+  lobbyIdleTimeoutSeconds: 1800
+  lobbyRegionCell: 0.1
+  lobbyPollIntervalSeconds: 5
   supabaseUrl: 
   supabaseAnonKey: 
   trailSaveInterval: 5
+  proximitySampleInterval: 10
+  proximityRadius: 100
+  backgroundGraceSeconds: 60
   osmTileUserAgent: LightRunners/1.0
   osmMinimapSize: 200
   osmDefaultZoom: 16
@@ -45,3 +56,15 @@ MonoBehaviour:
   beaconBobFrequency: 2
   beaconGlowIntensity: 2
   beaconRotationSpeed: 45
+  gatesPerPlayer: 0.5
+  gateCollectionRadius: 10
+  tailRadius: 2
+  matchDurationSeconds: 360
+  matchCountdownSeconds: 3
+  crashLumenLossNonLeader: 1
+  crashLumenLossLeader: 2
+  stolenLumenPickupSeconds: 8
+  emergenceGraceSeconds: 2
+  lightfieldBaseRadiusMeters: 120
+  lightfieldDomeCeilingMeters: 6
+  sweepSubdivideMaxStepMeters: 4

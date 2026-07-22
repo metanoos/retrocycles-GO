@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using UnityEngine;
 using LightRunners.Core;
+using LightRunners.Identity;
 using LightRunners.Trail;
 
 namespace LightRunners.Gameplay
@@ -21,7 +22,7 @@ namespace LightRunners.Gameplay
     ///    <see cref="LumenScoreboard"/> (Track A) on the locator, overwriting
     ///    <see cref="NullLumenScoreboard"/>.
     ///  • T (tail authority): constructs and registers <see cref="TailAuthority"/> (Track A);
-    ///    <see cref="FreezeTailAtCountdown"/> fires on entry to Countdown.
+    ///    the frozen-config validator fires on entry to Countdown.
     ///  • Q (host-mode transport): resolves <see cref="IMatchTransport"/> from the locator
     ///    (real <c>FusionLauncher</c> overwrites <see cref="NullMatchTransport"/>). Online/offline
     ///    detection observes <see cref="GameEvents.ConnectionStateChanged"/>.
@@ -188,6 +189,17 @@ namespace LightRunners.Gameplay
                 return;
             }
 
+            // Reject an illegal room config before leaving Idle, so the host can correct the
+            // setting and retry instead of becoming stranded in Warmup.
+            if (!FrozenMatchConfig.TryCreateFromMeters(
+                    GameConfig.Active.tailRadius,
+                    out _,
+                    out string configError))
+            {
+                Debug.LogError($"[MatchManager] Cannot begin match: {configError}");
+                return;
+            }
+
             // Resolve local player + reset state.
             _localPlayerId = ResolveLocalPlayerId();
             _knownPlayers.Clear();
@@ -225,6 +237,14 @@ namespace LightRunners.Gameplay
                 return;
             }
 
+            // Freeze and validate before mutating the FSM. An illegal host selection must not
+            // create a room whose clients disagree about collision geometry.
+            if (next == MatchState.Countdown && !TryFreezeTailAtCountdown(out string freezeError))
+            {
+                Debug.LogError($"[MatchManager] Cannot enter Countdown: {freezeError}");
+                return;
+            }
+
             var prev = State;
             State = next;
             Debug.Log($"[MatchManager] MatchState {prev} → {next}");
@@ -238,8 +258,7 @@ namespace LightRunners.Gameplay
                     break;
 
                 case MatchState.Countdown:
-                    // Decision T: freeze the tail radius on entry to Countdown (host-side).
-                    FreezeTailAtCountdown();
+                    // The config was frozen and validated before the state mutation above.
                     _countdownStartedAt = Time.timeAsDouble;
                     break;
 
@@ -284,11 +303,33 @@ namespace LightRunners.Gameplay
             return false;
         }
 
-        /// <summary>Decision T — freeze the tail radius at its current config value.</summary>
-        private void FreezeTailAtCountdown()
+        /// <summary>Decision T — validate and freeze the full collision contract.</summary>
+        private bool TryFreezeTailAtCountdown(out string error)
         {
-            if (_tailAuthority != null) _tailAuthority.FreezeAtCountdown();
-            else if (ServiceLocator.TryGet<ITailAuthority>(out var auth)) auth.FreezeAtCountdown();
+            bool frozen;
+            if (_tailAuthority != null)
+                frozen = _tailAuthority.TryFreezeAtCountdown(out error);
+            else if (ServiceLocator.TryGet<ITailAuthority>(out var auth) && auth != null)
+                frozen = auth.TryFreezeAtCountdown(out error);
+            else
+            {
+                error = "No tail authority is registered.";
+                return false;
+            }
+
+            if (frozen && IsHostAuthority)
+                PublishFrozenConfigToNetwork();
+            return frozen;
+        }
+
+        private void PublishFrozenConfigToNetwork()
+        {
+#if FUSION_WEAVER
+            var networkState = FindAnyObjectByType<LightRunners.Multiplayer.NetworkMatchState>();
+            if (networkState != null)
+                networkState.HostSetFrozenTailRadius(
+                    (_tailAuthority?.FrozenConfig ?? FrozenMatchConfig.Default).TailRadiusMeters);
+#endif
         }
 
         /// <summary>Decision M — configure the gate pool for the live player count.</summary>
@@ -432,8 +473,11 @@ namespace LightRunners.Gameplay
                 typeof(MatchManager).GetMethod(nameof(LivePlayersForReplay),
                     System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance));
 
-            // Frozen tail radius (decision T) and finish order are plain fields.
-            SetFieldValue(sink, "FrozenTailRadius", _tailAuthority?.FrozenTailRadius ?? GameConfig.Active.tailRadius);
+            // Exact frozen collision contract (decision T) and finish order are plain fields.
+            FrozenMatchConfig frozen = _tailAuthority?.FrozenConfig ?? FrozenMatchConfig.Default;
+            SetFieldValue(sink, "FrozenTailRadius", frozen.TailRadiusMeters);
+            SetFieldValue(sink, "FrozenPlayerHeadRadiusCm", FrozenMatchConfig.PlayerHeadRadiusCm);
+            SetFieldValue(sink, "FrozenConfigHash", frozen.Hash);
             var order = ComputeFinishOrder();
             if (order != null) SetFieldValue(sink, "FinishOrder", order);
         }
@@ -567,7 +611,7 @@ namespace LightRunners.Gameplay
             catch (Exception e) { Debug.LogException(e); }
             GameEvents.RaiseMatchStateChanged(prev, state);
 
-            if (state == MatchState.Countdown) FreezeTailAtCountdown();
+            if (state == MatchState.Countdown) TryFreezeTailAtCountdown(out _);
             if (state == MatchState.Live)
             {
                 _matchStartEpochSeconds = Time.timeAsDouble;
@@ -590,6 +634,6 @@ namespace LightRunners.Gameplay
         }
 
         /// <summary>Test-only: invoke the countdown freeze on the tail authority.</summary>
-        internal void TestFreezeTail() => FreezeTailAtCountdown();
+        internal void TestFreezeTail() => TryFreezeTailAtCountdown(out _);
     }
 }

@@ -70,6 +70,14 @@ namespace LightRunners.Multiplayer
         [Networked(OnChanged = nameof(OnFrozenTailRadiusChanged))]
         public float FrozenTailRadius { get; set; } = UnfrozenSentinel;
 
+        /// <summary>Hash of every integer-derived collision/clearance field.</summary>
+        [Networked]
+        public uint FrozenConfigHash { get; set; }
+
+        /// <summary>Serialized explicitly so old or modified room state cannot hide a different player radius.</summary>
+        [Networked]
+        public int FrozenPlayerHeadRadiusCm { get; set; }
+
         /// <summary>True on this peer once the host has frozen the radius.</summary>
         public bool HasFrozenTailRadius => FrozenTailRadius > 0f;
 
@@ -87,13 +95,15 @@ namespace LightRunners.Multiplayer
         public void HostSetFrozenTailRadius(float radius)
         {
             if (!Object.HasStateAuthority) return;
-            if (radius <= 0f)
+            if (!FrozenMatchConfig.TryCreateFromMeters(radius, out var config, out string error))
             {
-                Debug.LogWarning("[NetworkMatchState] Ignoring non-positive frozen tail radius.");
+                Debug.LogWarning($"[NetworkMatchState] Ignoring invalid frozen config: {error}");
                 return;
             }
             if (HasFrozenTailRadius) return; // frozen values are immutable for the match
-            FrozenTailRadius = radius;
+            FrozenPlayerHeadRadiusCm = FrozenMatchConfig.PlayerHeadRadiusCm;
+            FrozenConfigHash = config.Hash;
+            FrozenTailRadius = config.TailRadiusMeters;
         }
 
         /// <summary>
@@ -104,6 +114,8 @@ namespace LightRunners.Multiplayer
         {
             if (!Object.HasStateAuthority) return;
             FrozenTailRadius = UnfrozenSentinel;
+            FrozenPlayerHeadRadiusCm = 0;
+            FrozenConfigHash = 0u;
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -125,42 +137,36 @@ namespace LightRunners.Multiplayer
         /// dropped, which is correct because in that case no tail consumer is
         /// using the frozen radius yet.
         ///
-        /// CONTRACT for Track A's TailAuthority (or whoever implements
-        /// ITailAuthority client-side): expose a way to receive a peer-imposed
-        /// frozen value. The simplest contract is "if the local impl is NOT the
-        /// host, freeze at whatever radius the networked prop carries". Track A
-        /// can do that by having its client-side impl call FreezeAtCountdown()
-        /// and then expose FrozenTailRadius as a settable property; we cannot
-        /// set it from here without a new interface method, so the
-        /// recommendation is for Track A's client-side ITailAuthority impl to
-        /// poll this NetworkMatchState (via a new game-side adapter) OR to
-        /// expose a method like <c>ApplyNetworkedFreeze(float)</c> in v2.
-        ///
-        /// For the milestone, we LOG the propagated value so Track A can confirm
-        /// wiring visually; the locator-resolved ITailAuthority call below will
-        /// be a no-op until Track A exposes a setter (FreezeAtCountdown takes no
-        /// args today).
+        /// The client rederives all collision/clearance fields from integer centimetres and
+        /// rejects the room state if the fixed player radius contract or hash does not match.
         /// </summary>
         private void ApplyFrozenRadiusToLocalTailAuthority()
         {
             if (!HasFrozenTailRadius) return;
             if (ServiceLocator.TryGet<ITailAuthority>(out var tail) && tail != null)
             {
-                // FreezeAtCountdown is currently parameter-less; if the local impl
-                // is the host it has already frozen at the right value. If it is a
-                // client impl, Track A should override FreezeAtCountdown to read
-                // the networked prop (via a small adapter that finds this object).
-                tail.FreezeAtCountdown();
+                int tailRadiusCm = Mathf.RoundToInt(FrozenTailRadius * 100f);
+                if (FrozenPlayerHeadRadiusCm != FrozenMatchConfig.PlayerHeadRadiusCm)
+                {
+                    Debug.LogError(
+                        $"[NetworkMatchState] Rejected host player radius {FrozenPlayerHeadRadiusCm} cm; " +
+                        $"first playable requires {FrozenMatchConfig.PlayerHeadRadiusCm} cm.");
+                    return;
+                }
+                if (!tail.TryApplyNetworkedFreeze(tailRadiusCm, FrozenConfigHash, out string error))
+                    Debug.LogError($"[NetworkMatchState] Rejected host frozen config: {error}");
             }
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
-            Debug.Log($"[NetworkMatchState] Client received frozen tail radius = {FrozenTailRadius} m (decision T).");
+            Debug.Log($"[NetworkMatchState] Client received frozen tail radius = {FrozenTailRadius} m, config {FrozenConfigHash:X8} (decision T).");
 #endif
         }
 
         public override void Spawned()
         {
-            // Host starts unfrozen; clients will pick up the host's value when it
-            // freezes via the OnChanged callback.
+            // Late joiners may spawn after the value was frozen and therefore cannot rely on a
+            // future OnChanged callback. Validate the initial replicated snapshot immediately.
+            if (!Object.HasStateAuthority && HasFrozenTailRadius)
+                ApplyFrozenRadiusToLocalTailAuthority();
         }
     }
 }

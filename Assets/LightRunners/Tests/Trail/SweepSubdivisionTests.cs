@@ -130,10 +130,10 @@ namespace LightRunners.Trail.Tests
             var cur = North(7);
             var subs = Subdivide(prev, cur, maxStep: 2f);
 
-            Assert.AreEqual(subs[0].Item1, prev, "chain starts at prev");
-            Assert.AreEqual(subs[subs.Count - 1].Item2, cur, 1e-9, "chain ends at cur");
+            Assert.AreEqual(prev, subs[0].Item1, "chain starts at prev");
+            Assert.AreEqual(cur, subs[subs.Count - 1].Item2, "chain ends at cur");
             for (int i = 0; i < subs.Count - 1; i++)
-                Assert.AreEqual(subs[i].Item2, subs[i + 1].Item1, 1e-9,
+                Assert.AreEqual(subs[i].Item2, subs[i + 1].Item1,
                     $"chain discontinuous at sub[{i}].End → sub[{i + 1}].Start");
         }
 
@@ -146,9 +146,10 @@ namespace LightRunners.Trail.Tests
             var cur = new GeoPoint(37.0, 10 * MeterLon); // ~10 m east
             var subs = Subdivide(prev, cur, maxStep: 2f);
 
-            Assert.AreEqual(5, subs.Count);
-
             double original = prev.HorizontalDistanceTo(cur);
+            Assert.AreEqual((int)System.Math.Ceiling(original / 2.0), subs.Count,
+                "approximate longitude conversion may land just above 10 m; count follows measured distance");
+
             double sum = 0;
             foreach (var (a, b) in subs) sum += a.HorizontalDistanceTo(b);
             Assert.Less(System.Math.Abs(sum - original), 2.0, "longitude sweep length preserved");

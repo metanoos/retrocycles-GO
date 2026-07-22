@@ -10,11 +10,9 @@ namespace LightRunners.Trail
     /// Why this exists: in v1, <c>collisionThreshold</c> and <c>trailWidth</c> were decoupled
     /// tunables — a host could set a wide visual ribbon with a narrow collision radius and the
     /// runner would clip visually through their own tail without crashing, or vice-versa. Decision
-    /// T makes the tail radius the single source of truth: visuals, collisions, and safety
-    /// clearances all derive from <see cref="FrozenTailRadius"/>. The collision detector reads
-    /// <c>FrozenTailRadius × 2</c> as its near-gate threshold (a head touches a tail when their
-    /// combined radii overlap; with a unit head radius, head-radius + tail-radius = tail-radius + 1,
-    /// and we approximate as <c>2 × tail-radius</c> for the symmetric near-test).
+    /// T makes the tail radius the tunable source of truth while the player collision radius is
+    /// fixed at 2 m. Collision and clearance distances are integer-centimetre derivatives exposed
+    /// through <see cref="FrozenConfig"/>; no consumer approximates them independently.
     ///
     /// Lifecycle:
     ///  • Pre-countdown: <see cref="FrozenTailRadius"/> returns <see cref="GameConfig.tailRadius"/>
@@ -29,17 +27,16 @@ namespace LightRunners.Trail
     /// <see cref="ServiceLocator"/>, overwriting the <see cref="NullTailAuthority"/> installed
     /// by PlatformServiceRegistry. <see cref="TrailCollisionDetector.CheckCollision"/> resolves
     /// <c>ITailAuthority</c> from the locator and falls back to
-    /// <see cref="GameConfig.collisionThreshold"/> if no authority is registered (e.g. an editor
-    /// scene that hasn't bootstrapped the match core).
+    /// <see cref="FrozenMatchConfig.Default"/> if no authority is registered.
     /// </summary>
     public sealed class TailAuthority : ITailAuthority
     {
-        private float? _frozenTailRadius;
+        private FrozenMatchConfig? _frozenConfig;
 
         /// <summary>
         /// True once <see cref="FreezeAtCountdown"/> has been called; reset by <see cref="Unfreeze"/>.
         /// </summary>
-        public bool IsFrozen => _frozenTailRadius.HasValue;
+        public bool IsFrozen => _frozenConfig.HasValue;
 
         /// <summary>
         /// The authoritative tail radius (m). Returns the frozen snapshot once
@@ -50,9 +47,27 @@ namespace LightRunners.Trail
         {
             get
             {
-                if (_frozenTailRadius.HasValue) return _frozenTailRadius.Value;
-                float live = GameConfig.Active.tailRadius;
-                return live < 0f ? 0f : live;
+                if (_frozenConfig.HasValue) return _frozenConfig.Value.TailRadiusMeters;
+                return GameConfig.Active.tailRadius;
+            }
+        }
+
+        /// <summary>
+        /// Validated frozen contract. Before countdown, a legal live selection is reflected
+        /// immediately; an invalid inspector value yields the safe default, while
+        /// <see cref="TryFreezeAtCountdown"/> reports and rejects it.
+        /// </summary>
+        public FrozenMatchConfig FrozenConfig
+        {
+            get
+            {
+                if (_frozenConfig.HasValue) return _frozenConfig.Value;
+                return FrozenMatchConfig.TryCreateFromMeters(
+                    GameConfig.Active.tailRadius,
+                    out var live,
+                    out _)
+                    ? live
+                    : FrozenMatchConfig.Default;
             }
         }
 
@@ -63,9 +78,51 @@ namespace LightRunners.Trail
         /// </summary>
         public void FreezeAtCountdown()
         {
-            if (_frozenTailRadius.HasValue) return;
-            float v = GameConfig.Active.tailRadius;
-            _frozenTailRadius = v < 0f ? 0f : v;
+            TryFreezeAtCountdown(out _);
+        }
+
+        public bool TryFreezeAtCountdown(out string error)
+        {
+            if (_frozenConfig.HasValue)
+            {
+                error = string.Empty;
+                return true;
+            }
+
+            if (!FrozenMatchConfig.TryCreateFromMeters(
+                    GameConfig.Active.tailRadius,
+                    out var config,
+                    out error))
+                return false;
+
+            _frozenConfig = config;
+            return true;
+        }
+
+        public bool TryApplyNetworkedFreeze(int tailRadiusCm, uint configHash, out string error)
+        {
+            if (!FrozenMatchConfig.TryRestore(
+                    tailRadiusCm,
+                    FrozenMatchConfig.PlayerHeadRadiusCm,
+                    configHash,
+                    out var received,
+                    out error))
+                return false;
+
+            if (_frozenConfig.HasValue)
+            {
+                if (_frozenConfig.Value == received)
+                {
+                    error = string.Empty;
+                    return true;
+                }
+
+                error = "Tail authority is already frozen with a different match config.";
+                return false;
+            }
+
+            _frozenConfig = received;
+            return true;
         }
 
         /// <summary>
@@ -73,7 +130,7 @@ namespace LightRunners.Trail
         /// </summary>
         public void Unfreeze()
         {
-            _frozenTailRadius = null;
+            _frozenConfig = null;
         }
     }
 }

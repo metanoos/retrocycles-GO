@@ -7,24 +7,21 @@ namespace LightRunners.Trail
 {
     /// <summary>
     /// Per-frame trail-vs-movement collision check (spec §7.3). Tests the player's last
-    /// movement segment against every nearby trail segment via 2D XZ intersection, then
-    /// confirms with point-to-segment distance and an altitude gate. Fires
+    /// movement segment against every nearby trail segment via continuous 3D
+    /// segment-to-segment distance. Fires
     /// <see cref="OnCollisionDetected"/> with the owning player's id.
     ///
     /// Reentrancy guard: a single check can't overlap itself (one frame's query finishes
     /// before another begins).
     ///
     /// ─── Lightfield migration (active decisions N + T, 2026-07-18) ────────────
-    /// Decision T (tail geometry): the collision threshold now DERIVES from the authoritative
-    /// tail radius via <see cref="ITailAuthority.FrozenTailRadius"/> × 2 (resolved from the
-    /// <see cref="ServiceLocator"/>). This fixes the v1 bug where <c>collisionThreshold</c> and
-    /// <c>trailWidth</c> were decoupled — a host could set a wide visual ribbon with a narrow
-    /// collision radius and the runner would clip through their own tail. Falls back to
-    /// <see cref="GameConfig.collisionThreshold"/> when no authority is registered (e.g. an editor
-    /// scene that hasn't bootstrapped the match core) so playmode still works.
+    /// Decision T (tail geometry): the collision threshold is the host tail radius plus the
+    /// locked 2 m player radius, both carried by <see cref="FrozenMatchConfig"/>. This fixes the
+    /// v1 symmetric-radius approximation and falls back to the validated default contract when
+    /// no authority is registered.
     ///
     /// Decision N (no speed limit + sweep subdivision): there is no movement speed cap. A long
-    /// teleport or fast vehicle move is SUBDIVIDED into ≤ <see cref="GameConfig.sweepSubdivideMaxStepMeters"/>
+    /// teleport or fast vehicle move is SUBDIVIDED into locked 4 m microsegments
     /// sub-segments via <see cref="SubdivideSweep"/> and each is tested independently, so a long
     /// sweep can't jump PAST a trail between frames. The candidate query radius is expanded by
     /// half the sweep length (centred on the sweep midpoint) so trails the sweep passes over are
@@ -94,16 +91,17 @@ namespace LightRunners.Trail
             // otherwise land the player on top of a trail and kill the run at t=0.
             if (mgr.LocalTrail != null && mgr.RunElapsedSeconds < cfg.trailGracePeriod) return;
 
-            // Decision T: derive the near-gate threshold from the authoritative tail radius.
-            // Falls back to the legacy config threshold when no authority is registered so editor
-            // playmode still works before the match core boots.
-            float thr = ResolveCollisionThreshold();
+            // Decision T: exact capsule overlap threshold = tail radius + fixed head radius.
+            float thr = ResolveHeadToTrailCollisionDistance();
 
             // Decision N: subdivide the sweep so a long teleport / fast vehicle move can't skip
             // over a trail between frames. Each sub-segment is tested independently below.
             CoordinateConverter.EnsureReference(playerPos);
             _sweepBuffer.Clear();
-            foreach (var sub in SubdivideSweep(prevPos, playerPos, cfg.sweepSubdivideMaxStepMeters))
+            foreach (var sub in SubdivideSweep(
+                         prevPos,
+                         playerPos,
+                         FrozenMatchConfig.Default.CollisionMicrosegmentMeters))
                 _sweepBuffer.Add(sub);
 
             // Expand the candidate query radius to cover the whole sweep: query from the sweep
@@ -136,36 +134,18 @@ namespace LightRunners.Trail
                     _candidateWorldBuffer.Add((sAw, sBw, seg.OwnerId));
                 }
 
-                float thr2 = thr * 2f;
-
                 // Test each sub-segment of the sweep against every candidate. One hit is enough.
                 foreach (var sub in _sweepBuffer)
                 {
                     Vector3 wA = CoordinateConverter.GeoToWorld(sub.Item1);
                     Vector3 wB = CoordinateConverter.GeoToWorld(sub.Item2);
-                    Vector2 pA = new Vector2(wA.x, wA.z);
-                    Vector2 pB = new Vector2(wB.x, wB.z);
-                    float minPlayerY = Mathf.Min(wA.y, wB.y);
 
                     foreach (var cw in _candidateWorldBuffer)
                     {
-                        Vector2 sA = new Vector2(cw.Item1.x, cw.Item1.z);
-                        Vector2 sB = new Vector2(cw.Item2.x, cw.Item2.z);
-
-                        // 2D segment intersection on XZ plane (spec §7.3).
-                        bool intersect = SegmentsIntersect2D(pA, pB, sA, sB);
-                        // Distance gate (catches near-misses / coincident points).
-                        double d1 = PointToSegmentDistance(pA, sA, sB);
-                        double d2 = PointToSegmentDistance(pB, sA, sB);
-                        bool near = (d1 < thr) || (d2 < thr) || intersect;
-
-                        if (!near) continue;
-
-                        // Height gate: trails live on a band; ignore segments too far above/below.
-                        float minSegY = Mathf.Min(cw.Item1.y, cw.Item2.y);
-                        float maxSegY = Mathf.Max(cw.Item1.y, cw.Item2.y);
-                        float dy = Mathf.Max(0f, minSegY - minPlayerY, minPlayerY - maxSegY);
-                        if (dy > thr2) continue;
+                        // Continuous 3D capsule test: the swept head spine overlaps the tail
+                        // spine when their shortest distance is at or inside the combined radii.
+                        if (SegmentToSegmentDistance(wA, wB, cw.Item1, cw.Item2) > thr)
+                            continue;
 
                         // Local player crossing their own older trail is also a crash — that's the
                         // skip direction invariant (pitfall #1). Don't filter by ownerId == localPlayerId.
@@ -181,21 +161,107 @@ namespace LightRunners.Trail
         }
 
         /// <summary>
-        /// Resolve the near-gate threshold (decision T). Uses the authoritative tail radius
-        /// (<c>FrozenTailRadius × 2</c>) when an <see cref="ITailAuthority"/> is registered on the
-        /// <see cref="ServiceLocator"/>; otherwise falls back to
-        /// <see cref="GameConfig.collisionThreshold"/>. The ×2 covers the symmetric near-test
-        /// (head radius + tail radius; we model the head as a point so head touches tail when
-        /// their combined radii overlap, which for a unit-radius head is ≈ tail radius × 2).
+        /// Resolve the exact head-to-trail capsule overlap distance (decision T).
         /// </summary>
-        private static float ResolveCollisionThreshold()
+        public static float ResolveHeadToTrailCollisionDistance()
         {
             if (ServiceLocator.TryGet<ITailAuthority>(out var authority) && authority != null)
+                return authority.FrozenConfig.HeadToTrailCollisionMeters;
+            return FrozenMatchConfig.Default.HeadToTrailCollisionMeters;
+        }
+
+        /// <summary>
+        /// Shortest Euclidean distance between two finite 3D segments. Handles point segments,
+        /// parallel segments, crossings, and arbitrary altitude; this is the live swept-capsule
+        /// geometric truth used by <see cref="CheckCollision"/>.
+        /// </summary>
+        public static double SegmentToSegmentDistance(Vector3 p1, Vector3 q1, Vector3 p2, Vector3 q2)
+        {
+            const double epsilon = 1e-10;
+            Vector3 u = q1 - p1;
+            Vector3 v = q2 - p2;
+            Vector3 w = p1 - p2;
+            double a = Vector3.Dot(u, u);
+            double b = Vector3.Dot(u, v);
+            double c = Vector3.Dot(v, v);
+            double d = Vector3.Dot(u, w);
+            double e = Vector3.Dot(v, w);
+
+            if (a <= epsilon && c <= epsilon)
+                return Vector3.Distance(p1, p2);
+            if (a <= epsilon)
             {
-                float r = authority.FrozenTailRadius;
-                if (r > 0f) return r * 2f;
+                double t = Math.Max(0.0, Math.Min(1.0, e / c));
+                return Vector3.Distance(p1, p2 + v * (float)t);
             }
-            return GameConfig.Active.collisionThreshold;
+            if (c <= epsilon)
+            {
+                double s = Math.Max(0.0, Math.Min(1.0, -d / a));
+                return Vector3.Distance(p1 + u * (float)s, p2);
+            }
+
+            double denominator = a * c - b * b;
+            double sNumerator;
+            double sDenominator = denominator;
+            double tNumerator;
+            double tDenominator = denominator;
+
+            if (denominator <= epsilon)
+            {
+                sNumerator = 0.0;
+                sDenominator = 1.0;
+                tNumerator = e;
+                tDenominator = c;
+            }
+            else
+            {
+                sNumerator = b * e - c * d;
+                tNumerator = a * e - b * d;
+                if (sNumerator < 0.0)
+                {
+                    sNumerator = 0.0;
+                    tNumerator = e;
+                    tDenominator = c;
+                }
+                else if (sNumerator > sDenominator)
+                {
+                    sNumerator = sDenominator;
+                    tNumerator = e + b;
+                    tDenominator = c;
+                }
+            }
+
+            if (tNumerator < 0.0)
+            {
+                tNumerator = 0.0;
+                if (-d < 0.0)
+                    sNumerator = 0.0;
+                else if (-d > a)
+                    sNumerator = sDenominator;
+                else
+                {
+                    sNumerator = -d;
+                    sDenominator = a;
+                }
+            }
+            else if (tNumerator > tDenominator)
+            {
+                tNumerator = tDenominator;
+                if (-d + b < 0.0)
+                    sNumerator = 0.0;
+                else if (-d + b > a)
+                    sNumerator = sDenominator;
+                else
+                {
+                    sNumerator = -d + b;
+                    sDenominator = a;
+                }
+            }
+
+            double sc = Math.Abs(sNumerator) <= epsilon ? 0.0 : sNumerator / sDenominator;
+            double tc = Math.Abs(tNumerator) <= epsilon ? 0.0 : tNumerator / tDenominator;
+            Vector3 closestDelta = w + (float)sc * u - (float)tc * v;
+            return closestDelta.magnitude;
         }
 
         /// <summary>

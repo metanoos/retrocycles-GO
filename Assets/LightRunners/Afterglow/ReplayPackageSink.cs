@@ -93,9 +93,15 @@ namespace LightRunners.Afterglow
         /// <summary>
         /// Optional authoritative tail radius (decision T). Track D wires this from
         /// <c>ITailAuthority</c>; the sink writes it into <see cref="ReplayPackage.FrozenTailRadius"/>
-        /// before freezing. If unset the package default (0.5 m) is used.
+        /// before freezing. If unset the package default (2.0 m) is used.
         /// </summary>
         public float? FrozenTailRadius;
+
+        /// <summary>Fixed player radius copied from the exact host-frozen config.</summary>
+        public int? FrozenPlayerHeadRadiusCm;
+
+        /// <summary>Hash copied from the exact host-frozen config.</summary>
+        public uint? FrozenConfigHash;
 
         /// <summary>The package this sink is filling. Read-only view; capture via this sink.</summary>
         public ReplayPackage Package => _package;
@@ -189,8 +195,29 @@ namespace LightRunners.Afterglow
             if (FinishOrder != null)
                 _package.SetFinishOrder(new List<string>(FinishOrder));
 
-            if (FrozenTailRadius.HasValue)
+            if (FrozenTailRadius.HasValue
+                && FrozenPlayerHeadRadiusCm.HasValue
+                && FrozenConfigHash.HasValue)
+            {
+                int tailRadiusCm = (int)Math.Round(
+                    FrozenTailRadius.Value * 100.0,
+                    MidpointRounding.AwayFromZero);
+                if (FrozenMatchConfig.TryRestore(
+                        tailRadiusCm,
+                        FrozenPlayerHeadRadiusCm.Value,
+                        FrozenConfigHash.Value,
+                        out var config,
+                        out string error))
+                    _package.SetFrozenMatchConfig(config);
+                else
+                    Debug.LogError($"[ReplayPackageSink] Rejected frozen match config: {error}");
+            }
+            else if (FrozenTailRadius.HasValue)
+            {
+                // Backward compatibility for older capture callers. New match finalization always
+                // supplies all three fields and therefore takes the validated branch above.
                 _package.SetFrozenTailRadius(FrozenTailRadius.Value);
+            }
 
             _package.SetMatchEndTime(DateTime.UtcNow);
             _package.Freeze();

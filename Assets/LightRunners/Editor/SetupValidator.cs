@@ -158,19 +158,25 @@ namespace LightRunners.Editor
             sb.AppendLine($"[{(gatesOk ? "PASS" : "WARN")}] GameConfig.gatesPerPlayer > 0 (currently {cfg.gatesPerPlayer}; decision M)");
             if (gatesOk) pass++;
 
-            // tailRadius >= 0.05 (decision T — frozen at countdown; everything collision derives from it).
-            bool tailOk = cfg.tailRadius >= 0.05f;
-            sb.AppendLine($"[{(tailOk ? "PASS" : "WARN")}] GameConfig.tailRadius >= 0.05 (currently {cfg.tailRadius}; decision T)");
+            // Legal tail values are a discrete host control; player radius remains fixed in code.
+            int tailCm = Mathf.RoundToInt(cfg.tailRadius * 100f);
+            bool tailOk = Mathf.Abs(cfg.tailRadius * 100f - tailCm) < 0.01f
+                          && FrozenMatchConfig.IsLegalTailRadiusCm(tailCm);
+            sb.AppendLine($"[{(tailOk ? "PASS" : "WARN")}] GameConfig.tailRadius is 1.5–4.0 m in 0.5 m steps (currently {cfg.tailRadius}; player radius fixed at 2 m)");
             if (tailOk) pass++;
 
-            // matchDurationSeconds >= 10 (decision O — timed match; 6 min default).
-            bool durOk = cfg.matchDurationSeconds >= 10f;
-            sb.AppendLine($"[{(durOk ? "PASS" : "WARN")}] GameConfig.matchDurationSeconds >= 10 (currently {cfg.matchDurationSeconds}; decision O)");
+            // Ground-alpha host clock: 3–10 whole minutes.
+            bool durOk = cfg.matchDurationSeconds >= 180f
+                         && cfg.matchDurationSeconds <= 600f
+                         && Mathf.Approximately(cfg.matchDurationSeconds % 60f, 0f);
+            sb.AppendLine($"[{(durOk ? "PASS" : "WARN")}] GameConfig.matchDurationSeconds is 3–10 whole minutes (currently {cfg.matchDurationSeconds}s; decision O)");
             if (durOk) pass++;
 
-            // gateCollectionRadius >= 0.1 (decision G — trigger radius floor).
-            bool radiusOk = cfg.gateCollectionRadius >= 0.1f;
-            sb.AppendLine($"[{(radiusOk ? "PASS" : "WARN")}] GameConfig.gateCollectionRadius >= 0.1 (currently {cfg.gateCollectionRadius}; decision G)");
+            // Ground-alpha Gate radius plus its cross-setting packing constraint.
+            bool radiusOk = cfg.gateCollectionRadius >= 3f
+                            && cfg.gateCollectionRadius <= 20f
+                            && cfg.gateCollectionRadius <= 0.2f * cfg.lightfieldBaseRadiusMeters;
+            sb.AppendLine($"[{(radiusOk ? "PASS" : "WARN")}] GameConfig.gateCollectionRadius is 3–20 m and <= 20% of Lightfield radius (currently {cfg.gateCollectionRadius}m; decision G)");
             if (radiusOk) pass++;
         }
 
