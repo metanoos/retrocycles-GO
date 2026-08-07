@@ -167,6 +167,7 @@ namespace LightRunners.Gameplay
         private void OnRunAgain()
         {
             Hide();
+            LightRunners.Afterglow.AfterglowViewController.ResetRuntimeInstance();
             if (GameManager.HasInstance)
             {
                 GameManager.Instance.SetState(GameState.Lobby);
@@ -177,6 +178,7 @@ namespace LightRunners.Gameplay
         private void OnContinue()
         {
             Hide();
+            LightRunners.Afterglow.AfterglowViewController.ResetRuntimeInstance();
             if (GameManager.HasInstance) GameManager.Instance.SetState(GameState.Lobby);
         }
 

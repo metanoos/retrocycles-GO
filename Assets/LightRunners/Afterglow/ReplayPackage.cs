@@ -103,10 +103,8 @@ namespace LightRunners.Afterglow
 
     /// <summary>
     /// One crash event in a <see cref="ReplayPackage"/>. Decision F (crash penalty tiers).
-    /// See the IMatchReplaySink crash-metadata gap note on
-    /// <see cref="ReplayPackageSink"/>: full <see cref="Tier"/> and
-    /// <see cref="LumensDropped"/> require the proper sink contract (Track D calls it);
-    /// the legacy <c>GameEvents.PlayerCrashed</c> bus carries only the player id.
+    /// The host records it through <see cref="IMatchReplaySink.RecordCrash"/> after resolving
+    /// the authoritative <see cref="Tier"/> and <see cref="LumensDropped"/>.
     /// </summary>
     [Serializable]
     public sealed class CrashEvent

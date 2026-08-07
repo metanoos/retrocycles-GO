@@ -19,20 +19,14 @@ namespace LightRunners.Lightfield
     /// scoreboard already awards +1 Lumen per GateCollected — so a StolenLumen pickup re-uses
     /// that path with no new event. Track A and Track D please note:
     ///   • Track A: any Lumen award triggered by GateCollected must accept ids in the synthetic
-    ///     range without trying to despawn a real Gate (no such LumenGate exists). Recommended:
-    ///     resolve <c>IGateDirector</c> via ServiceLocator and let it ignore unknown ids —
-    ///     <see cref="GateSpawner"/> already no-ops on ids it doesn't own.
+    ///     range. Unlike a presentation Gate, this pickup owns its one-shot accepted state and
+    ///     therefore publishes the accepted collection directly; no GateDirector despawn exists.
     ///   • Track D: this MonoBehaviour lives in <c>LightRunners.Lightfield</c>; instantiate it
     ///     from a Resources prefab or via <see cref="CreateInstance"/> at the crash site. The
-    ///     runner collider must expose <see cref="IRunnerIdentity"/> (see LumenGate) and be
-    ///     tagged <c>LumenGate.RunnerTag</c> for OnTriggerEnter to fire.
+    ///     runner collider must expose <see cref="IRunnerIdentity"/> (see LumenGate).
     ///
-    /// ─── Heuristic caveat (decision S) ───────────────────────────────────────────
-    /// Subscribing to <c>LumensChanged</c> deltas cannot tell apart "crash drop" from
-    /// "referee deduction" or "scoreboard reconciliation". The cleaner contract is for Track A
-    /// to expose the authoritative dropped-Lumen queue (see <see cref="StolenLumenRecord"/>) on
-    /// its <c>ILumenScoreboard</c> implementation; that swap is a tracked follow-up, not a
-    /// milestone blocker.
+    /// Dropped pickups are driven by the authoritative <see cref="StolenLumenRecord"/> queue;
+    /// score reconciliation events never create presentation objects.
     /// </summary>
     [RequireComponent(typeof(SphereCollider))]
     public class StolenLumenPickup : MonoBehaviour
@@ -113,8 +107,7 @@ namespace LightRunners.Lightfield
         private void OnTriggerEnter(Collider other)
         {
             if (_collected || other == null) return;
-            if (!other.CompareTag(LumenGate.RunnerTag) && other.GetComponentInParent<IRunnerIdentity>() == null)
-                return;
+            if (other.GetComponentInParent<IRunnerIdentity>() == null) return;
 
             string collector = other.GetComponentInParent<IRunnerIdentity>()?.PlayerId;
             if (string.IsNullOrEmpty(collector))
@@ -129,10 +122,9 @@ namespace LightRunners.Lightfield
 
             _collected = true;
             int syntheticId = System.Threading.Interlocked.Increment(ref _nextSyntheticId) - 1;
-            // Re-use the canonical award path: Track A's scoreboard awards +1 Lumen per
-            // GateCollected. The synthetic id is above any real gate's range, so
-            // GateSpawner.CollectGate safely no-ops.
-            GameEvents.RaiseGateCollected(syntheticId, collector);
+            // Re-use the canonical accepted-award path. This pickup owns the one-shot
+            // _collected guard; the synthetic id is above every real Gate range.
+            GameEvents.RaiseGateCollected(syntheticId, collector, _dropSite);
             Destroy(gameObject);
         }
 
@@ -163,53 +155,60 @@ namespace LightRunners.Lightfield
     /// <summary>
     /// Optional host-side singleton that bridges <see cref="GameEvents.LumensChanged"/> (Track A's
     /// scoreboard) to <see cref="StolenLumenPickup"/> spawns. Attach once per match; enable in
-    /// <see cref="MatchState.Live"/>. The cleaner contract (Track A exposes a dropped-Lumen
-    /// queue of <see cref="StolenLumenRecord"/>) replaces this heuristic post-milestone — see
-    /// the StolenLumenPickup contract note. Decision F, decision S.
+    /// <see cref="MatchState.Live"/>.
+    ///
+    /// Round-1 review fix R1-F2/R2-F3: previously this spawner observed
+    /// <c>GameEvents.LumensChanged</c> negative deltas as a heuristic, was never placed in any
+    /// scene, and the authoritative <c>StolenLumenQueue</c> on <c>ILumenScoreboard</c> was never
+    /// drained. It now implements <see cref="IStolenLumenSpawner"/> and drains the queue directly
+    /// (which carries the crash GeoPoint + lifetime) when <see cref="DrainAndSpawn"/> is called
+    /// by <c>MatchManager.HandlePlayerCrash</c>. Decision F, decision S.
+    ///
+    /// Round-2 fix R2-F5: the LumensChanged heuristic subscription was DELETED — it caused
+    /// double-spawn (LumenScoreboard.ApplyCrashPenalty both enqueues a record AND fires
+    /// RaiseLumensChanged, so the heuristic fired in addition to DrainAndSpawn). The queue-drain
+    /// path is strictly more correct (it carries the crash GeoPoint; the heuristic used a
+    /// last-known position that was never wired). UpdatePlayerPosition is removed for the same
+    /// reason — its only caller was the heuristic path.
     /// </summary>
-    public sealed class StolenLumenPickupSpawner : MonoBehaviour
+    public sealed class StolenLumenPickupSpawner : MonoBehaviour, IStolenLumenSpawner
     {
-        [Tooltip("Track each runner's last known position so we can spawn a pickup at the crash site. Updates from GameEvents.LumensChanged alone don't carry geo; in production this is fed by the per-tick position pipeline.")]
+        [Tooltip("Enable drain-and-spawn. Disable to drop stolen Lumens silently (debug only).")]
         [SerializeField] private bool _enabled = true;
 
-        private readonly System.Collections.Generic.Dictionary<string, GeoPoint> _lastPositions =
-            new System.Collections.Generic.Dictionary<string, GeoPoint>();
-
-        private void OnEnable() => GameEvents.LumensChanged += OnLumensChanged;
-        private void OnDisable() => GameEvents.LumensChanged -= OnLumensChanged;
-
-        /// <summary>Feed the latest geo position for a runner (called by the position pipeline per tick).</summary>
-        public void UpdatePlayerPosition(string playerId, GeoPoint at)
+        private void OnEnable()
         {
-            if (string.IsNullOrEmpty(playerId)) return;
-            _lastPositions[playerId] = at;
+            // Register self as the IStolenLumenSpawner (overwrites NullStolenLumenSpawner).
+            // Round-1 review fix: nothing previously registered the real spawner.
+            ServiceLocator.Register<IStolenLumenSpawner>(this);
+        }
+        private void OnDisable()
+        {
+            // Only restore the null fallback if we still own the slot; a replacement instance
+            // may already have registered during a scene transition.
+            if (ReferenceEquals(ServiceLocator.Get<IStolenLumenSpawner>(), this))
+                ServiceLocator.Register<IStolenLumenSpawner>(new NullStolenLumenSpawner());
         }
 
-        private void OnLumensChanged(string playerId, int newTotal)
+        /// <summary>
+        /// Drain the authoritative dropped-Lumen queue on the registered <c>ILumenScoreboard</c>
+        /// and spawn a <see cref="StolenLumenPickup"/> for each record. Called by
+        /// <c>MatchManager.HandlePlayerCrash</c>. Each record carries the crash GeoPoint + the
+        /// number of Lumens dropped. One +1 pickup is created for each dropped Lumen so the
+        /// amount removed from the victim can be fully recovered by other runners.
+        /// </summary>
+        public void DrainAndSpawn()
         {
-            if (!_enabled || string.IsNullOrEmpty(playerId)) return;
-            if (!_lastPositions.TryGetValue(playerId, out var pos))
+            if (!_enabled) return;
+            // Resolve through the Core contract so Lightfield stays independent of Trail.
+            var scoreboard = ServiceLocator.Get<ILumenScoreboard>();
+            if (scoreboard == null) return;
+            while (scoreboard.TryDequeueStolenLumen(out var record))
             {
-                // Heuristic limitation: no last-known position yet → cannot place a pickup.
-                // Cleaner contract (Track A queue) ships the geo with the drop event.
-                return;
+                if (!record.IsValid) continue;
+                for (int i = 0; i < record.LumensDropped; i++)
+                    StolenLumenPickup.CreateInstance(record.At, record.PlayerId);
             }
-
-            // Negative delta = Lumens dropped (crash penalty per decision F). newTotal is the
-            // authoritative post-drop value; the prior total isn't on this event, so we trigger
-            // a single pickup per negative-delta observation. Documented heuristic: this fires
-            // once per LumensChanged with a decrease, which is the right granularity for crash
-            // penalties (each penalty is a single integer drop).
-            if (newTotal < GetCachedTotal(playerId))
-            {
-                StolenLumenPickup.CreateInstance(pos, playerId);
-            }
-            _totals[playerId] = newTotal;
         }
-
-        private readonly System.Collections.Generic.Dictionary<string, int> _totals =
-            new System.Collections.Generic.Dictionary<string, int>();
-        private int GetCachedTotal(string playerId)
-            => _totals.TryGetValue(playerId, out var t) ? t : 0;
     }
 }

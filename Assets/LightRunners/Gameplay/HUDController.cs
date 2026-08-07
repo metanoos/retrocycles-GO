@@ -51,12 +51,6 @@ namespace LightRunners.Gameplay
         {
             if (GameManager.HasInstance) HandleStateChanged(GameState.Initializing, GameManager.Instance.State);
             WireButtons();
-
-            // TEMP DIAGNOSTIC: confirm button visibility at startup.
-            if (startRunButton != null)
-            {
-                Debug.Log($"[HUDController] startRunButton: activeSelf={startRunButton.activeSelf} activeInHierarchy={startRunButton.activeInHierarchy} parent={startRunButton.transform.parent?.name}");
-            }
         }
 
         private void WireButtons()

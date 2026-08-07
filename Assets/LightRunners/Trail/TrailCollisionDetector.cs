@@ -47,10 +47,6 @@ namespace LightRunners.Trail
         private readonly List<(Vector3, Vector3, string)> _candidateWorldBuffer = new List<(Vector3, Vector3, string)>(64);
         private bool _isChecking;
 
-        private double _runStartTimestamp = -1.0;
-        private GeoPoint _prevPos;
-        private bool _havePrev;
-
         public bool IsFallback => isFallback;
         public bool IsEnabled { get; set; } = true;
 
@@ -59,15 +55,18 @@ namespace LightRunners.Trail
 
         public void BeginRun(GeoPoint startPos)
         {
-            _prevPos = startPos;
-            _havePrev = true;
-            _runStartTimestamp = Time.timeAsDouble;
+            _isChecking = false;
+            _candidates.Clear();
+            _sweepBuffer.Clear();
+            _candidateWorldBuffer.Clear();
         }
 
         public void EndRun()
         {
-            _havePrev = false;
-            _runStartTimestamp = -1.0;
+            _isChecking = false;
+            _candidates.Clear();
+            _sweepBuffer.Clear();
+            _candidateWorldBuffer.Clear();
         }
 
         /// <summary>
@@ -89,7 +88,20 @@ namespace LightRunners.Trail
             // Run-start grace (spec §4.4): for trailGracePeriod seconds after Start Run, no
             // collision fires at all — GPS needs a beat to settle, and a noisy first fix can
             // otherwise land the player on top of a trail and kill the run at t=0.
-            if (mgr.LocalTrail != null && mgr.RunElapsedSeconds < cfg.trailGracePeriod) return;
+            //
+            // Round-1 review fix R2-F9: emergenceGraceSeconds (decision D's Lightfield-specific
+            // match-start grace) was declared in GameConfig but never read — hosts tuning it saw
+            // no effect. Take the max of the two so either config knob works; emergenceGrace
+            // extends trailGrace for matches without shortening it for solo runs.
+            float graceSeconds = Mathf.Max(cfg.trailGracePeriod, cfg.emergenceGraceSeconds);
+            if (mgr.LocalTrail != null && mgr.RunElapsedSeconds < graceSeconds) return;
+
+            // Round-1 review fix R2-F10: respawn invulnerability (decision F). MatchManager sets a
+            // short invulnerability window after a crash so the respawning runner can move off the
+            // crash site without chain-dying against the same trail web. The window was set but
+            // never consulted here. Resolve MatchManager reflectively (Trail doesn't reference
+            // Gameplay) to avoid an asmdef cycle; null-safe.
+            if (IsLocalRunnerInvulnerable()) return;
 
             // Decision T: exact capsule overlap threshold = tail radius + fixed head radius.
             float thr = ResolveHeadToTrailCollisionDistance();
@@ -262,6 +274,29 @@ namespace LightRunners.Trail
             double tc = Math.Abs(tNumerator) <= epsilon ? 0.0 : tNumerator / tDenominator;
             Vector3 closestDelta = w + (float)sc * u - (float)tc * v;
             return closestDelta.magnitude;
+        }
+
+        /// <summary>
+        /// Round-1 review fix R2-F10: consult MatchManager's respawn-inulnerability window so a
+        /// respawning runner doesn't chain-die against the trail web that just killed them. Trail
+        /// can't reference Gameplay (asmdef cycle), so resolve via reflective ServiceLocator lookup
+        /// by interface name — null-safe (solo runs without MatchManager always return false).
+        /// </summary>
+        private static bool IsLocalRunnerInvulnerable()
+        {
+            try
+            {
+                object session = ServiceLocator.GetByInterfaceName("LightRunners.Core.IMatchSession");
+                if (session == null) return false;
+                // Reflectively read an "IsLocalRunnerInvulnerable" bool property if present.
+                var prop = session.GetType().GetProperty("IsLocalRunnerInvulnerable");
+                if (prop == null) return false;
+                return prop.GetValue(session) is bool b && b;
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         /// <summary>

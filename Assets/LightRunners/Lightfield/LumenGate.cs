@@ -8,8 +8,8 @@ namespace LightRunners.Lightfield
     /// <see cref="StolenLumenPickup"/>) can resolve the colliding runner's player id. Implement
     /// on the runner's avatar root OR a sibling component (e.g. the <c>BeaconController</c>'s
     /// parent, or a thin <c>RunnerTag</c> MonoBehaviour). Track D wires this on the local +
-    /// networked player prefabs; the milestone ships with the interface and a TODO so a missing
-    /// implementation is logged rather than crashing. Decisions G, L.
+    /// networked player prefabs; a missing/unstamped identity is logged and cannot collect.
+    /// Decisions G, L.
     /// </summary>
     public interface IRunnerIdentity
     {
@@ -23,7 +23,7 @@ namespace LightRunners.Lightfield
     /// and <see cref="StolenLumenPickup"/> can resolve the colliding player. The spawner
     /// (<c>GameManager</c> for local, <c>NetworkPlayer</c> for remote) calls <see cref="SetPlayerId"/>
     /// when the avatar is instantiated; until then <see cref="PlayerId"/> is empty and gates
-    /// collect as "unknown" (with a warning, per the LumenGate contract).
+    /// ignore its trigger.
     ///
     /// Reconciliation addition (Track D did not ship an IRunnerIdentity impl; this closes the
     /// wiring gap so the milestone loop resolves the collector without per-trigger warnings).
@@ -47,9 +47,9 @@ namespace LightRunners.Lightfield
     /// A glowing Lumen Gate anchored to the ground (decision G): a hemisphere visual (the lower
     /// half of a sphere buried at <c>transform.position.y</c>) plus a single spherical trigger
     /// volume of radius <c>GameConfig.Active.gateCollectionRadius</c> (decision L). A runner
-    /// entering the trigger fires <see cref="GameEvents.RaiseGateCollected"/> exactly once; the
-    /// authoritative <see cref="GateSpawner"/> (host) reacts via its bus hook and respawns a
-    /// replacement elsewhere (decision M).
+    /// entering the trigger asks the authoritative <see cref="IGateDirector"/> to consume it.
+    /// Only the director's accepted path fires <see cref="GameEvents.GateCollected"/> and
+    /// respawns a replacement (decision M).
     ///
     /// Ground-only milestone (decision S): always a hemisphere. Aerial (full orb) is stubbed —
     /// <see cref="Initialize"/> accepts <see cref="GatePlacement.Aerial"/> but logs a warning
@@ -175,9 +175,9 @@ namespace LightRunners.Lightfield
             if (_collected || !_gateId.HasValue) return;
             if (other == null) return;
 
-            // Cheap tag filter first; fall back to component probe if Track D hasn't tagged yet.
-            if (!other.CompareTag(RunnerTag) && other.GetComponentInParent<IRunnerIdentity>() == null)
-                return;
+            // Identity is the authoritative filter. The old Runner tag is optional and may not
+            // exist in a fresh project; CompareTag would throw before this fallback could run.
+            if (other.GetComponentInParent<IRunnerIdentity>() == null) return;
 
             string collector = ResolveCollectorPlayerId(other);
             if (string.IsNullOrEmpty(collector))
@@ -186,12 +186,16 @@ namespace LightRunners.Lightfield
                 // the scene generator (Track G) attaches it to the runner prefab and the spawner
                 // (GameManager/NetworkPlayer) calls SetPlayerId. This warning fires only if the
                 // prefab is missing the component or the spawner hasn't set the id yet.
-                Debug.LogWarning($"[LumenGate] Triggered by {other.name} but no {nameof(IRunnerIdentity)} found; collecting as \"unknown\".");
-                collector = "unknown";
+                Debug.LogWarning($"[LumenGate] Triggered by {other.name} before its {nameof(IRunnerIdentity)} was stamped; ignoring collection.");
+                return;
             }
 
-            _collected = true;
-            GameEvents.RaiseGateCollected(_gateId.Value.Value, collector);
+            if (ServiceLocator.TryGet<IGateDirector>(out var director)
+                && director != null
+                && director.TryCollectGate(_gateId.Value, collector))
+            {
+                _collected = true;
+            }
         }
 
         private static string ResolveCollectorPlayerId(Collider other)

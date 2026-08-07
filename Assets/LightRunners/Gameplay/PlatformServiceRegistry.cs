@@ -90,6 +90,8 @@ namespace LightRunners.Gameplay
                 ServiceLocator.Register<IMatchReplaySink>(new NullMatchReplaySink());
             if (!ServiceLocator.IsRegistered<ITailAuthority>())
                 ServiceLocator.Register<ITailAuthority>(new NullTailAuthority());
+            if (!ServiceLocator.IsRegistered<IStolenLumenSpawner>())
+                ServiceLocator.Register<IStolenLumenSpawner>(new NullStolenLumenSpawner());
         }
 
         private void OnDestroy()

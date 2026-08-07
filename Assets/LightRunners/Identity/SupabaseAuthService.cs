@@ -67,6 +67,11 @@ namespace LightRunners.Identity
             if (PlayerRepository.HasInstance)
                 PlayerRepository.Instance.RegisterOrUpdatePlayer(_identity);
 
+            // Outbox RPCs are SECURITY DEFINER and require the restored JWT. PlayerRepository's
+            // Start can run before async auth completes, so the authentication boundary is the
+            // first reliable recovery point after an offline restart.
+            PendingOpsQueue.Flush(_supabase);
+
             OnAuthenticated?.Invoke();
             onSuccess?.Invoke();
         }

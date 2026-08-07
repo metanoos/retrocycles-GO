@@ -7,6 +7,7 @@ using LightRunners.Location;
 using LightRunners.Trail;
 using LightRunners.Identity;
 using LightRunners.Backend;
+using LightRunners.Afterglow;
 
 namespace LightRunners.Gameplay
 {
@@ -76,9 +77,6 @@ namespace LightRunners.Gameplay
         private int _peakNearby;
         private float _proximityTimer;
 
-        // TEMP DIAGNOSTIC: throttle for the trail-recording logs above.
-        private float _lastStateLog = -1f;
-
         // App lifecycle (spec §20).
         private DateTime _pausedAtUtc;
 
@@ -86,6 +84,7 @@ namespace LightRunners.Gameplay
         private TrailRepository _trailRepository;
 
         private Coroutine _connectRoutine;
+        private MatchManager _subscribedMatchManager;
 
         // ─────────────────────────────────────────────────────────────────────
         // Lifecycle
@@ -93,6 +92,16 @@ namespace LightRunners.Gameplay
         protected override void Awake()
         {
             base.Awake();
+
+            // Older checked-in scenes predate the Lightfield match layer. Mount the runtime
+            // owner here so a normal checkout is playable without running the editor-only
+            // scene generator first. AddComponent invokes MatchManager.Awake immediately.
+            if (!MatchManager.HasInstance
+                && FindAnyObjectByType<MatchManager>(FindObjectsInactive.Include) == null)
+            {
+                gameObject.AddComponent<MatchManager>();
+            }
+
             // Spec §3.1: TrailRepository lives on the GameManager GO and is locator-registered.
             _trailRepository = GetComponent<TrailRepository>();
             if (_trailRepository == null) _trailRepository = gameObject.AddComponent<TrailRepository>();
@@ -108,23 +117,29 @@ namespace LightRunners.Gameplay
         protected virtual void OnEnable()
         {
             GameEvents.PlayerCrashed += OnPlayerCrashed;
+            GameEvents.PlayerRespawned += OnPlayerRespawned;
             GameEvents.ConnectionStateChanged += OnConnectionStateChanged;
+            GameEvents.MatchExpired += OnMatchExpired;
             if (fallbackDetector != null) fallbackDetector.OnCollisionDetected += OnFallbackCollision;
-            if (MatchManager.HasInstance)
-                MatchManager.Instance.RespawnRequested += OnRespawnRequested;
+            TrySubscribeToMatchRespawn();
         }
 
         protected virtual void OnDisable()
         {
             GameEvents.PlayerCrashed -= OnPlayerCrashed;
+            GameEvents.PlayerRespawned -= OnPlayerRespawned;
             GameEvents.ConnectionStateChanged -= OnConnectionStateChanged;
+            GameEvents.MatchExpired -= OnMatchExpired;
             if (fallbackDetector != null) fallbackDetector.OnCollisionDetected -= OnFallbackCollision;
-            if (MatchManager.HasInstance)
-                MatchManager.Instance.RespawnRequested -= OnRespawnRequested;
+            UnsubscribeFromMatchRespawn();
         }
 
         protected virtual void Start()
         {
+            // MatchManager may awaken after this component's OnEnable. Retry once all scene
+            // Awake calls have completed so component ordering cannot drop respawn requests.
+            TrySubscribeToMatchRespawn();
+
             // Decide initial state by scene. If an IAuthService is registered, start at Lobby
             // (Game scene); otherwise Login (Login scene — handled by LoginUI).
             if (ServiceLocator.TryGet<IAuthService>(out var auth) && auth != null && auth.IsAuthenticated)
@@ -144,9 +159,24 @@ namespace LightRunners.Gameplay
 
         protected override void OnDestroy()
         {
+            UnsubscribeFromMatchRespawn();
             if (LocationProvider.HasInstance)
                 LocationProvider.Instance.OnPositionUpdated -= OnPositionUpdate;
             base.OnDestroy();
+        }
+
+        private void TrySubscribeToMatchRespawn()
+        {
+            if (_subscribedMatchManager != null || !MatchManager.HasInstance) return;
+            _subscribedMatchManager = MatchManager.Instance;
+            _subscribedMatchManager.RespawnRequested += OnRespawnRequested;
+        }
+
+        private void UnsubscribeFromMatchRespawn()
+        {
+            if (_subscribedMatchManager == null) return;
+            _subscribedMatchManager.RespawnRequested -= OnRespawnRequested;
+            _subscribedMatchManager = null;
         }
 
         private void Update()
@@ -197,7 +227,16 @@ namespace LightRunners.Gameplay
                 }
                 else
                 {
-                    FinalizeRun(crashed: false, causedBy: null);
+                    if (MatchManager.HasInstance
+                        && MatchManager.Instance.State != MatchState.Idle
+                        && MatchManager.Instance.State != MatchState.Expired)
+                    {
+                        MatchManager.Instance.EndMatch();
+                    }
+                    else
+                    {
+                        FinalizeRun(crashed: false, causedBy: null);
+                    }
                 }
             }
         }
@@ -268,6 +307,9 @@ namespace LightRunners.Gameplay
             if (State != GameState.Lobby && State != GameState.PartyLobby && State != GameState.Starting)
                 return;
 
+            // Defensive lifecycle boundary for programmatic starts as well as Run Again.
+            AfterglowViewController.ResetRuntimeInstance();
+
             LocalPlayerId = ResolveLocalPlayerId();
             CurrentForm = ResolveStartForm();
             Color color = ResolveTrailColor(CurrentForm);
@@ -329,27 +371,37 @@ namespace LightRunners.Gameplay
             Action<bool> onConn = _ => done = true;
             GameEvents.ConnectionStateChanged += onConn;
 
+            // Round-1 review fix R1-F8: the prior -= was OUTSIDE any finally, so an early
+            // StopCoroutine (from RequestStartRun's branch above or OnDestroy) halted the
+            // coroutine mid-yield and leaked the delegate on the static bus — stale delegates
+            // then fired on later connection-state changes, calling into disposed state. Wrap
+            // the whole body in try/finally so the unsubscribe always runs.
             try
             {
-                transport.ConnectMatch(room, LocalPlayerId);
+                try
+                {
+                    transport.ConnectMatch(room, LocalPlayerId);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning($"[GameManager] IMatchTransport.ConnectMatch threw: {e.Message}");
+                    done = true;
+                }
+
+                float deadline = Time.realtimeSinceStartup + GameConfig.Active.connectTimeoutSeconds;
+                while (!done && Time.realtimeSinceStartup < deadline)
+                    yield return null;
+
+                // OnlineRace is set by the ConnectionStateChanged event; on timeout it stays null
+                // and the run proceeds solo with the §8.4 fallback detector.
+                if (!done) Debug.LogWarning("[GameManager] Connect timed out — starting solo (offline race).");
+                _connectRoutine = null;
+                BeginRunning();
             }
-            catch (Exception e)
+            finally
             {
-                Debug.LogWarning($"[GameManager] IMatchTransport.ConnectMatch threw: {e.Message}");
-                done = true;
+                GameEvents.ConnectionStateChanged -= onConn;
             }
-
-            float deadline = Time.realtimeSinceStartup + GameConfig.Active.connectTimeoutSeconds;
-            while (!done && Time.realtimeSinceStartup < deadline)
-                yield return null;
-
-            GameEvents.ConnectionStateChanged -= onConn;
-
-            // OnlineRace is set by the ConnectionStateChanged event; on timeout it stays null
-            // and the run proceeds solo with the §8.4 fallback detector.
-            if (!done) Debug.LogWarning("[GameManager] Connect timed out — starting solo (offline race).");
-            _connectRoutine = null;
-            BeginRunning();
         }
 
         private void BeginRunning()
@@ -402,8 +454,12 @@ namespace LightRunners.Gameplay
             if (MatchManager.HasInstance && MatchManager.Instance.State != MatchState.Idle
                 && MatchManager.Instance.State != MatchState.Expired)
             {
+                // Round-2 fix R2-F6: previously this called EndMatch AND FinalizeRun — but
+                // EndMatch drives ExpireMatch which raises MatchExpired, which fires
+                // OnMatchExpired → FinalizeRun synchronously inside the EndMatch call. The
+                // explicit FinalizeRun on the next line was a second call (re-entrancy: double
+                // persist, double summary). Drop it; the MatchExpired bus path drives FinalizeRun.
                 MatchManager.Instance.EndMatch();
-                FinalizeRun(crashed: false, causedBy: null);
                 return;
             }
             FinalizeRun(crashed: false, causedBy: null);
@@ -452,16 +508,7 @@ namespace LightRunners.Gameplay
         // ─────────────────────────────────────────────────────────────────────
         private void OnPositionUpdate(GeoPoint pos)
         {
-            if (State != GameState.Running)
-            {
-                // TEMP DIAGNOSTIC: see why trail isn't recording — once per second.
-                if (Time.unscaledTime - _lastStateLog > 1f)
-                {
-                    _lastStateLog = Time.unscaledTime;
-                    Debug.Log($"[GameManager] OnPositionUpdate dropping — State={State} (need Running)");
-                }
-                return;
-            }
+            if (State != GameState.Running) return;
 
             // Append to local trail.
             if (TrailManager.HasInstance)
@@ -480,13 +527,15 @@ namespace LightRunners.Gameplay
                         lt2.PruneTo(model.MaxSegments);
                 }
 
-                // TEMP DIAGNOSTIC: once per second, confirm trail grew.
-                if (Time.unscaledTime - _lastStateLog > 1f)
-                {
-                    _lastStateLog = Time.unscaledTime;
-                    var lt = TrailManager.Instance.LocalTrail;
-                    Debug.Log($"[GameManager] OnPositionUpdate running — localTrail?={lt != null} points={lt?.PointCount ?? -1} allTrails={TrailManager.Instance.AllTrails.Count}");
-                }
+            }
+
+            if (MatchManager.HasInstance
+                && MatchManager.Instance.State == MatchState.Live
+                && MatchManager.Instance.IsHostAuthority
+                && ServiceLocator.TryGet<ILightfieldVolume>(out var volume)
+                && volume != null)
+            {
+                volume.CheckPlayer(LocalPlayerId, pos);
             }
 
             // Fallback collision: runs whenever no local-authority NetworkPlayer detector is
@@ -508,7 +557,10 @@ namespace LightRunners.Gameplay
         private void OnFallbackCollision(string causedByPlayerId)
         {
             // Same bus as the Fusion path → identical pipeline.
-            GameEvents.RaisePlayerCrashed(causedByPlayerId);
+            GeoPoint at = LocationProvider.HasInstance
+                ? LocationProvider.Instance.CurrentPosition
+                : default;
+            GameEvents.RaisePlayerCrashed(LocalPlayerId, causedByPlayerId, at);
         }
 
         private void OnConnectionStateChanged(bool online)
@@ -522,12 +574,18 @@ namespace LightRunners.Gameplay
             }
         }
 
-        private void OnPlayerCrashed(string causedByPlayerId)
+        private void OnPlayerCrashed(PlayerCrashEvent crash)
         {
-            // Double-fire guard: both Fusion and the fallback can fire (spec §16).
             if (State != GameState.Running) return;
-            if (_crashPipelineFired) return;
-            _crashPipelineFired = true;
+            string crashedPlayerId = string.IsNullOrEmpty(crash.CrashedPlayerId)
+                ? LocalPlayerId
+                : crash.CrashedPlayerId;
+            bool isLocalCrash = crashedPlayerId == LocalPlayerId;
+
+            // Both Fusion and fallback detectors can report the local collision. Keep the guard
+            // set until the respawn grace window completes, not merely until this call returns.
+            if (isLocalCrash && _crashPipelineFired) return;
+            if (isLocalCrash) _crashPipelineFired = true;
 
             // Decision F: crash is no longer terminal in match mode. Delegate the penalty +
             // respawn to MatchManager, which applies the Lumen penalty, records full metadata
@@ -536,17 +594,66 @@ namespace LightRunners.Gameplay
             // is handled again.
             if (MatchManager.HasInstance && MatchManager.Instance.State == MatchState.Live)
             {
-                GeoPoint at = LocationProvider.HasInstance
-                    ? LocationProvider.Instance.CurrentPosition
-                    : default;
-                MatchManager.Instance.HandlePlayerCrash(
-                    !string.IsNullOrEmpty(causedByPlayerId) ? causedByPlayerId : LocalPlayerId, at);
-                _crashPipelineFired = false; // allow the next crash event through (post-respawn)
+                MatchManager.Instance.HandlePlayerCrash(crashedPlayerId, crash.At);
+
+                // Round-2 fix R2-F11: crash FX (ScreenCrashFlash + timeScale slow-mo, spec §16)
+                // were lost in match mode — the in-match branch returned before reaching the
+                // crashSequence.Play call inside FinalizeRun. The crash is no longer terminal
+                // but it should still feel dramatic during respawn. Pitfall #16 still holds:
+                // CrashSequence.OnDestroy restores timeScale=1 unconditionally.
+                try { if (isLocalCrash && crashSequence != null && TrailManager.HasInstance)
+                    crashSequence.Play(TrailManager.Instance.LocalTrail?.TrailColor ?? Color.cyan); }
+                catch (Exception e) { Debug.LogException(e); }
+                return;
+            }
+
+            if (MatchManager.HasInstance
+                && MatchManager.Instance.State != MatchState.Idle
+                && MatchManager.Instance.State != MatchState.Expired)
+            {
+                // Collision is disabled as a gameplay consequence before Live and while the
+                // result is settling. Ignore a stray detector signal rather than terminating
+                // the run while leaving the match FSM/backend row alive.
+                if (isLocalCrash) _crashPipelineFired = false;
                 return;
             }
 
             // Non-match (solo) path: crash still terminates the run.
-            FinalizeRun(crashed: true, causedBy: causedByPlayerId);
+            if (isLocalCrash)
+                FinalizeRun(crashed: true, causedBy: crash.CausedByPlayerId);
+        }
+
+        /// <summary>
+        /// Match-clock-expiry handler (Round-1 review fix R2-F5: previously nothing reacted to
+        /// <see cref="GameEvents.MatchExpired"/> — the player was stranded in
+        /// <see cref="GameState.Running"/> forever with the clock at zero, no summary, no Afterglow,
+        /// no return-to-lobby. Decision O ("most Lumens wins on expiry") had no UI manifestation.)
+        /// Finalizes the run, which persists it and shows RunSummaryUI; RunSummaryUI reads the
+        /// post-expiry Lumen tally (MatchManager froze the replay package before raising) so the
+        /// displayed winner matches the authoritative scoreboard.
+        /// </summary>
+        private void OnMatchExpired()
+        {
+            if (MatchManager.HasInstance && MatchManager.Instance.State == MatchState.Expired)
+            {
+                // Round-2 fix R2-F9: AfterglowViewController.ShowOverview was never called — the
+                // frozen ReplayPackage was built (sink freezes on MatchExpired) but no component
+                // read it to drive the Overview camera. Decision A/U's "completed trails persist
+                // as neon world art" was unreachable. Show the Overview from the frozen package
+                // before FinalizeRun (which shows the run-summary card).
+                try
+                {
+                    var controller = AfterglowViewController.EnsureRuntimeInstance();
+                    if (ServiceLocator.TryGet<IMatchReplaySink>(out var sink)
+                        && sink is ReplayPackageSink concreteSink)
+                    {
+                        controller.ShowOverview(concreteSink.Package);
+                    }
+                }
+                catch (Exception e) { Debug.LogException(e); }
+
+                FinalizeRun(crashed: false, causedBy: null);
+            }
         }
 
         /// <summary>
@@ -556,27 +663,42 @@ namespace LightRunners.Gameplay
         ///     across the crash site (spec §20),
         ///   • reset the fallback collision detector at the respawn point so the in-flight
         ///     movement segment can't instantly re-crash into the same trail,
-        ///   • reset the crash-pipeline guard so the next crash event is handled normally,
-        ///   • (TODO) teleport the avatar to the respawn offset — left to the avatar controller
-        ///     in the integration phase; for the milestone the runner simply resumes from the
-        ///     current GPS position.
+        ///   • keep the crash-pipeline guard armed until MatchManager observes both its grace
+        ///     time and safe physical clearance from the collision site. A GPS game cannot
+        ///     teleport the person, so rearming is movement-based rather than a virtual offset.
         /// </summary>
         private void OnRespawnRequested(string playerId, GeoPoint crashSite)
         {
+            if (playerId != LocalPlayerId) return;
             if (TrailManager.HasInstance)
                 TrailManager.Instance.MarkDiscontinuity();
 
             if (fallbackDetector != null)
                 fallbackDetector.BeginRun(crashSite);
 
-            _crashPipelineFired = false;
             _haveLastPos = false;
 
-            Debug.Log($"[GameManager] Runner respawned after crash (playerId={playerId}, crash={crashSite}).");
+            Debug.Log($"[GameManager] Runner respawn started (playerId={playerId}, crash={crashSite}).");
+        }
+
+        private void OnPlayerRespawned(string playerId)
+        {
+            if (playerId == LocalPlayerId) _crashPipelineFired = false;
         }
 
         private void FinalizeRun(bool crashed, string causedBy)
         {
+            // Defensive lifecycle barrier: every terminal run path must close an active match
+            // first. EndMatch synchronously raises MatchExpired, whose handler re-enters here
+            // only after the match has reached Expired.
+            if (MatchManager.HasInstance
+                && MatchManager.Instance.State != MatchState.Idle
+                && MatchManager.Instance.State != MatchState.Expired)
+            {
+                MatchManager.Instance.EndMatch();
+                return;
+            }
+
             // Spec §16 invariants:
             //  • Save the local trail BEFORE EndRun nulls it.
             //  • CrashSequence + its OnDestroy restore timeScale.

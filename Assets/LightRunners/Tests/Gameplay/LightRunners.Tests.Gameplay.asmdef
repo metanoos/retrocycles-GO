@@ -6,6 +6,7 @@
         "LightRunners.Gameplay",
         "LightRunners.Trail",
         "LightRunners.Location",
+        "LightRunners.Afterglow",
         "LightRunners.UI",
         "UnityEngine.TestRunner",
         "UnityEditor.TestRunner"

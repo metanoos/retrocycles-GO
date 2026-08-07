@@ -1,10 +1,28 @@
 using System;
+using System.Collections.Generic;
+using System.Text;
 using UnityEngine;
 using LightRunners.Core;
 using LightRunners.Trail;
 
 namespace LightRunners.Backend
 {
+    public readonly struct MatchResultWrite
+    {
+        public string PlayerId { get; }
+        public int Lumens { get; }
+        public int FinishRank { get; }
+        public string Role { get; }
+
+        public MatchResultWrite(string playerId, int lumens, int finishRank, string role)
+        {
+            PlayerId = playerId ?? string.Empty;
+            Lumens = lumens;
+            FinishRank = finishRank;
+            Role = role ?? string.Empty;
+        }
+    }
+
     /// <summary>
     /// Player row + run history + Lightfield match persistence (spec §12.3 / §12.4;
     /// decisions E/O for the match tables). Rides on the SupabaseManager GO.
@@ -14,9 +32,9 @@ namespace LightRunners.Backend
     /// <see cref="PendingOpsQueue"/> (spec §21) — the summary panel never blocks
     /// on the network.
     ///
-    /// <see cref="CreateMatch"/> / <see cref="RecordMatchResult"/> /
-    /// <see cref="FinalizeMatch"/> drive the <c>matches</c> + <c>match_players</c>
-    /// tables (decision O: timed match, most Lumens wins). They mirror the
+    /// <see cref="RecordMatchResult"/> / <see cref="FinalizeMatch"/> /
+    /// <see cref="FinalizeMatchWithResults"/> drive the <c>matches</c> +
+    /// <c>match_players</c> tables (decision O: timed match, most Lumens wins). They mirror the
     /// lobby-RPC pattern in <see cref="LobbyServices"/>: <c>RpcWithRetry</c> +
     /// PostgREST error-token extraction surfaced verbatim to the caller.
     ///
@@ -36,20 +54,15 @@ namespace LightRunners.Backend
             public int total_runs;
         }
 
-        // PostgREST returns scalar RPC results as a bare JSON value, e.g.
-        // create_match() returns the match UUID as `"abc-def"` (a quoted string).
-        // JsonUtility can't parse a bare scalar, so we unwrap the quotes manually.
         // Match lifecycle RPC error tokens (mirrors LobbyServices.ErrorToken).
         private static readonly string[] MatchErrorTokens =
-            { "not_authenticated", "not_host", "not_found", "bad_role" };
+            {
+                "not_authenticated", "not_host", "not_found", "bad_role",
+                "bad_lumens", "bad_finish_rank", "bad_results", "host_already_exists",
+                "match_id_conflict"
+            };
 
         private static SupabaseManager Supabase => SupabaseManager.HasInstance ? SupabaseManager.Instance : null;
-
-        private void Start()
-        {
-            // Connectivity may have returned since the last session — flush queued writes (§21).
-            PendingOpsQueue.Flush(Supabase);
-        }
 
         public void RegisterOrUpdatePlayer(PlayerIdentity identity)
         {
@@ -131,33 +144,8 @@ namespace LightRunners.Backend
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Host-only. Inserts a <c>matches</c> row + a host <c>match_players</c> row
-        /// and returns the new match id. Call from <c>IMatchSession.BeginMatch</c>.
-        /// </summary>
-        public void CreateMatch(string roomId, string hostPlayerId, Action<Guid> onSuccess, Action<string> onError)
-        {
-            var sb = Supabase;
-            if (sb == null || !sb.IsConfigured) { onError?.Invoke("offline"); return; }
-            if (string.IsNullOrEmpty(hostPlayerId)) { onError?.Invoke("bad_host_id"); return; }
-
-            string json = "{"
-                + $"\"p_room_id\":{JsonString(roomId)},"
-                + $"\"p_host_player_id\":{JsonString(hostPlayerId)}"
-                + "}";
-
-            sb.RpcWithRetry("create_match", json,
-                onSuccess: resp =>
-                {
-                    Guid matchId = ParseUuidScalar(resp);
-                    if (matchId == Guid.Empty) { onError?.Invoke("bad create_match response"); return; }
-                    onSuccess?.Invoke(matchId);
-                },
-                onError: err => onError?.Invoke(MatchErrorToken(err)));
-        }
-
-        /// <summary>
-        /// Upsert a player's match result. Host writes any player's row; a player
-        /// may write their own. <paramref name="role"/> is the lowercase PlayerRole
+        /// Host-only: upsert a player's authoritative match result.
+        /// <paramref name="role"/> is the lowercase PlayerRole
         /// token (<c>runner</c>/<c>host</c>/<c>referee</c>).
         /// </summary>
         public void RecordMatchResult(Guid matchId, string playerId, int lumens, int finishRank, string role)
@@ -200,6 +188,75 @@ namespace LightRunners.Backend
                 onError: err => onError?.Invoke(MatchErrorToken(err)));
         }
 
+        /// <summary>
+        /// Host-only atomic match close. The server writes every final player row and marks the
+        /// match ended in one PostgreSQL transaction, so a finalized match cannot expose a
+        /// partial standings table.
+        /// </summary>
+        public void FinalizeMatchWithResults(
+            Guid matchId,
+            string roomId,
+            string hostPlayerId,
+            IReadOnlyList<MatchResultWrite> results,
+            string winnerPlayerId,
+            int durationSeconds,
+            Action onSuccess,
+            Action<string> onError)
+        {
+            var sb = Supabase;
+            if (matchId == Guid.Empty) { onError?.Invoke("bad_match_id"); return; }
+            if (string.IsNullOrEmpty(hostPlayerId)) { onError?.Invoke("bad_host_id"); return; }
+            if (results == null || results.Count == 0) { onError?.Invoke("bad_results"); return; }
+
+            var rows = new StringBuilder("[");
+            for (int i = 0; i < results.Count; i++)
+            {
+                if (i > 0) rows.Append(',');
+                MatchResultWrite result = results[i];
+                rows.Append('{')
+                    .Append("\"player_id\":").Append(JsonString(result.PlayerId)).Append(',')
+                    .Append("\"lumens\":").Append(result.Lumens).Append(',')
+                    .Append("\"finish_rank\":").Append(result.FinishRank).Append(',')
+                    .Append("\"role\":").Append(JsonString(result.Role))
+                    .Append('}');
+            }
+            rows.Append(']');
+
+            string json = "{"
+                + $"\"p_match_id\":\"{matchId}\","
+                + $"\"p_room_id\":{JsonString(roomId)},"
+                + $"\"p_host_player_id\":{JsonString(hostPlayerId)},"
+                + $"\"p_results\":{rows},"
+                + $"\"p_winner_player_id\":{JsonString(winnerPlayerId)},"
+                + $"\"p_duration_seconds\":{Math.Max(0, durationSeconds)}"
+                + "}";
+
+            // This is the only durable operation for a match: one PostgreSQL transaction creates
+            // the row, writes standings, and closes it. Nothing is persisted mid-match, so an app
+            // kill cannot leave an open match. Stable-ID/idempotent replay covers lost responses.
+            PendingOpsQueue.EnqueueUnique("finalize_match_with_results", json);
+            if (sb == null || !sb.IsConfigured)
+            {
+                onError?.Invoke("offline");
+                return;
+            }
+
+            sb.RpcWithRetry("finalize_match_with_results", json,
+                onSuccess: _ =>
+                {
+                    PendingOpsQueue.Remove("finalize_match_with_results", json);
+                    PendingOpsQueue.Flush(sb);
+                    onSuccess?.Invoke();
+                },
+                onError: err =>
+                {
+                    string token = MatchErrorToken(err);
+                    if (IsPermanentMatchWriteError(token))
+                        PendingOpsQueue.Remove("finalize_match_with_results", json);
+                    onError?.Invoke(token);
+                });
+        }
+
         // ─────────────────────────────────────────────────────────────────────
         // Helpers
         // ─────────────────────────────────────────────────────────────────────
@@ -216,19 +273,23 @@ namespace LightRunners.Backend
             return raw;
         }
 
-        /// <summary>
-        /// Parse a scalar UUID returned by an RPC. PostgREST returns scalar RPC
-        /// results as a bare quoted JSON string (<c>"abc-def"</c>) or, for some
-        /// configurations, a JSON object. Handle the quoted-string shape; fall
-        /// back to Guid.TryParse on the raw text. Returns Guid.Empty on failure.
-        /// </summary>
-        private static Guid ParseUuidScalar(string resp)
+        private static bool IsPermanentMatchWriteError(string token)
         {
-            if (string.IsNullOrEmpty(resp)) return Guid.Empty;
-            string trimmed = resp.Trim();
-            if (trimmed.StartsWith("\"") && trimmed.EndsWith("\"") && trimmed.Length >= 2)
-                trimmed = trimmed.Substring(1, trimmed.Length - 2);
-            return Guid.TryParse(trimmed, out var g) ? g : Guid.Empty;
+            switch (token)
+            {
+                case "not_host":
+                case "bad_role":
+                case "bad_lumens":
+                case "bad_finish_rank":
+                case "bad_results":
+                case "host_already_exists":
+                case "match_id_conflict":
+                    return true;
+                default:
+                    // Authentication expiry and transport/HTTP failures can recover after the
+                    // user restores a session or connectivity returns.
+                    return false;
+            }
         }
 
         private static string JsonString(string s)

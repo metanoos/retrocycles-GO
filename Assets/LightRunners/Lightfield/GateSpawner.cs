@@ -122,10 +122,9 @@ namespace LightRunners.Lightfield
     /// Authoritative Gate spawn/collect lifecycle. Implements <see cref="IGateDirector"/>
     /// (decisions G, L, M, R). Host-side plain C# — visual instantiation is the consumer's job
     /// (subscribe to <see cref="GateSpawned"/>/<see cref="GateDespawned"/> and create the
-    /// <see cref="LumenGate"/> GameObjects). Collection is routed back in via
-    /// <see cref="CollectGate"/>; <see cref="HookGameEvents"/> opt-in wires the static bus path
-    /// so a <see cref="LumenGate"/> OnTriggerEnter can raise <c>GameEvents.RaiseGateCollected</c>
-    /// and reach the spawner without a hard reference.
+    /// <see cref="LumenGate"/> GameObjects). Collection is accepted atomically through
+    /// <see cref="TryCollectGate"/>; only that accepted path raises the static collection event
+    /// consumed by scoring and replay.
     /// </summary>
     public sealed class GateSpawner : IGateDirector
     {
@@ -141,21 +140,58 @@ namespace LightRunners.Lightfield
         private readonly Dictionary<GateId, LumenGateState> _active = new Dictionary<GateId, LumenGateState>();
         private int _nextDensityId = 1;
         private int _nextBonusId = BonusGateIdBase;
-        private bool _hooked;
+        private int _densityCount;
+        private int _bonusCount;
 
-        public int ActiveGateCount => _active.Count;
+        /// <summary>
+        /// Density-pool (baseline) gate count only. Round-1 review fix R1-F10/R2: previously
+        /// returned <c>_active.Count</c> which included bonus gates, breaking
+        /// <c>ValidateGateCollectHost</c>'s id-range bound. Bonus gates are tracked separately
+        /// via <see cref="ActiveBonusGateCount"/>.
+        /// </summary>
+        public int ActiveGateCount => _densityCount;
+
+        /// <summary>Referee-placed bonus gates currently active (decision R).</summary>
+        public int ActiveBonusGateCount => _bonusCount;
 
         public event Action<GateId, GeoPoint, GatePlacement> GateSpawned;
         public event Action<GateId> GateDespawned;
         public event Action<GateId, string> GateCollected;
 
+        /// <summary>
+        /// Look up an active gate's position (Round-1 fix R1-F15/R2-F8: host-side validation and
+        /// replay sink both need gate positions). Returns false for unknown/collected ids.
+        /// </summary>
+        public bool TryGetGatePosition(GateId id, out GeoPoint position)
+        {
+            if (_active.TryGetValue(id, out var state)) { position = state.Position; return true; }
+            position = default;
+            return false;
+        }
+
         /// <param name="volume">The play volume gates must spawn inside.</param>
         /// <param name="sampler">Spawn position source; null → <see cref="DefaultGatePositionSampler"/>.</param>
-        public GateSpawner(ILightfieldVolume volume, IGatePositionSampler sampler = null)
+        /// <param name="refereeTokenValidator">
+        /// Optional token validator for <see cref="PlaceBonusGate"/> (decision R). Round-1 review
+        /// fix R1-F16/R2-F12: previously <see cref="PlaceBonusGate"/> only checked the token was
+        /// non-empty, and the real <c>RefereeTokenValidator</c> (in Multiplayer) was only invoked
+        /// by <c>RefereeClient</c> — any host-side caller could bypass it by calling
+        /// PlaceBonusGate directly. The validator is now injected at construction so the check is
+        /// unavoidable regardless of caller. Track C's <c>RefereeClient</c> registers the real
+        /// validator when it constructs/registers the GateSpawner; the default is the legacy
+        /// non-empty check for tests and scenes that don't run a referee.
+        /// </param>
+        public GateSpawner(ILightfieldVolume volume, IGatePositionSampler sampler = null,
+            Func<string, bool> refereeTokenValidator = null)
         {
             _volume = volume ?? throw new ArgumentNullException(nameof(volume));
             _sampler = sampler ?? new DefaultGatePositionSampler();
+            _refereeTokenValidator = refereeTokenValidator ?? DefaultTokenCheck;
         }
+
+        private readonly Func<string, bool> _refereeTokenValidator;
+        private static bool DefaultTokenCheck(string token) => !string.IsNullOrEmpty(token);
+
 
         /// <summary>
         /// Decision M: set the active pool size to
@@ -179,18 +215,20 @@ namespace LightRunners.Lightfield
 
         /// <summary>
         /// Decision R — referee-only bonus gate. v2 (full Gate-Director UI) is deferred per
-        /// decision S; the milestone validates only that <paramref name="refereeToken"/> is
-        /// non-empty. Real token validation is <b>Track C's</b> job (<c>RefereeTokenValidator</c>);
-        /// TODO(track-C): wire authoritative referee-token + role check here.
+        /// decision S. Round-1 review fix R1-F16/R2-F12: the token is now validated via the
+        /// injected <c>refereeTokenValidator</c> (constructor arg) rather than a local non-empty
+        /// check, so the validation is unavoidable regardless of caller. Track C's
+        /// <c>RefereeClient</c> injects the real <c>RefereeTokenValidator.Validate</c> when it
+        /// constructs the GateSpawner; tests get the default non-empty check.
         ///
         /// Bonus gates do NOT count toward <see cref="ActiveGateCount"/> and are NOT replaced on
         /// collection (they're one-shot rewards).
         /// </summary>
         public void PlaceBonusGate(GeoPoint at, GatePlacement placement, string refereeToken)
         {
-            if (string.IsNullOrEmpty(refereeToken))
+            if (!_refereeTokenValidator(refereeToken))
             {
-                UnityEngine.Debug.LogWarning("[GateSpawner] PlaceBonusGate rejected: empty referee token. Track C will validate the real token.");
+                UnityEngine.Debug.LogWarning("[GateSpawner] PlaceBonusGate rejected: referee token failed validation.");
                 return;
             }
 
@@ -204,6 +242,7 @@ namespace LightRunners.Lightfield
             var id = new GateId(_nextBonusId++);
             var state = new LumenGateState(id, at, placement, isBonus: true);
             _active[id] = state;
+            _bonusCount++;
 
             GameEvents.RaiseGateSpawned(id.Value, at.latitude, at.longitude, at.altitude, placement);
             try { GateSpawned?.Invoke(id, at, placement); }
@@ -211,15 +250,23 @@ namespace LightRunners.Lightfield
         }
 
         /// <summary>
-        /// Canonical collection entry point. Removes the gate from the active pool (if present),
-        /// fires <see cref="GateDespawned"/> + <see cref="GateCollected"/>, and — for density
-        /// (non-bonus) gates — respawns ONE new gate elsewhere to preserve the active count
-        /// (decision M). Safe to call with an unknown id (headless host may race); no-op then.
+        /// Compatibility wrapper for older direct callers. New code should use
+        /// <see cref="TryCollectGate"/> so it can observe rejection.
         /// </summary>
         public void CollectGate(GateId gateId, string collectorPlayerId)
+            => TryCollectGate(gateId, collectorPlayerId);
+
+        /// <summary>
+        /// Canonical authoritative collection entry point. Removes an active gate, fires its
+        /// instance lifecycle events, restores density, and only then publishes the accepted
+        /// <see cref="GameEvents.GateCollected"/> notification. Unknown/stale ids never reach
+        /// score or replay mutation.
+        /// </summary>
+        public bool TryCollectGate(GateId gateId, string collectorPlayerId)
         {
+            if (string.IsNullOrEmpty(collectorPlayerId)) return false;
             if (!_active.TryGetValue(gateId, out var state))
-                return;
+                return false;
 
             bool wasBonus = state.IsBonus;
             DespawnGate(gateId);
@@ -230,46 +277,26 @@ namespace LightRunners.Lightfield
             // Decision M: density gates are replaced; bonus gates are one-shot.
             if (!wasBonus)
                 SpawnDensityGate();
+
+            // Score/replay observers see only an accepted, fully-settled director mutation.
+            GameEvents.RaiseGateCollected(gateId.Value, collectorPlayerId, state.Position);
+            return true;
         }
 
         /// <summary>Snapshot of currently-active gates (density + bonus). Read-only view.</summary>
         public IReadOnlyCollection<LumenGateState> ActiveGates => _active.Values;
 
-        /// <summary>Wire the static <see cref="GameEvents.GateCollected"/> bus into CollectGate.</summary>
-        public void HookGameEvents()
-        {
-            if (_hooked) return;
-            GameEvents.GateCollected += OnBusGateCollected;
-            _hooked = true;
-        }
-
-        /// <summary>Disconnect the static bus. Call on match end / Dispose.</summary>
-        public void UnhookGameEvents()
-        {
-            if (!_hooked) return;
-            GameEvents.GateCollected -= OnBusGateCollected;
-            _hooked = false;
-        }
-
-        /// <summary>Tear down: unhook bus + clear pool (no despawn events fired).</summary>
+        /// <summary>Tear down: clear the pool (no despawn events fired).</summary>
         public void Dispose()
         {
-            UnhookGameEvents();
             _active.Clear();
+            _densityCount = 0;
+            _bonusCount = 0;
         }
 
         // ─────────────────────────────────────────────────────────────────────
         // Internals
         // ─────────────────────────────────────────────────────────────────────
-
-        private void OnBusGateCollected(int gateIdValue, string collectorPlayerId)
-        {
-            // Only react to gates we own; ignore StolenLumenPickup synthetic ids (those award
-            // directly) and any unrelated ids.
-            var id = new GateId(gateIdValue);
-            if (_active.ContainsKey(id))
-                CollectGate(id, collectorPlayerId);
-        }
 
         private void SpawnDensityGate()
         {
@@ -277,6 +304,7 @@ namespace LightRunners.Lightfield
             var id = new GateId(_nextDensityId++);
             var state = new LumenGateState(id, at, GatePlacement.Ground, isBonus: false);
             _active[id] = state;
+            _densityCount++;
 
             GameEvents.RaiseGateSpawned(id.Value, at.latitude, at.longitude, at.altitude, GatePlacement.Ground);
             try { GateSpawned?.Invoke(id, at, GatePlacement.Ground); }
@@ -285,7 +313,12 @@ namespace LightRunners.Lightfield
 
         private void DespawnGate(GateId id)
         {
+            // Capture IsBonus BEFORE removing so we can maintain the split counters
+            // (Round-1 review fix R1-F10).
+            bool isBonus = _active.TryGetValue(id, out var s) && s.IsBonus;
             if (!_active.Remove(id)) return;
+            if (isBonus) _bonusCount = Math.Max(0, _bonusCount - 1);
+            else _densityCount = Math.Max(0, _densityCount - 1);
             GameEvents.RaiseGateDespawned(id.Value);
             try { GateDespawned?.Invoke(id); }
             catch (Exception ex) { UnityEngine.Debug.LogException(ex); }

@@ -20,10 +20,12 @@ namespace LightRunners.Core
     /// <summary>No-op <see cref="IMatchSession"/>: never leaves <see cref="MatchState.Idle"/>.</summary>
     public sealed class NullMatchSession : IMatchSession
     {
+        public string MatchId => string.Empty;
         public MatchState State => MatchState.Idle;
         public float TimeRemaining => 0f;
         public bool IsHostAuthority => false;
         public event Action<MatchState, MatchState> StateChanged { add { } remove { } }
+        public void RegisterPlayer(string playerId) { }
         public void BeginMatch() { }
         public void EndMatch() { }
     }
@@ -37,6 +39,11 @@ namespace LightRunners.Core
         public int GetLumens(string playerId) => 0;
         public int Award(string playerId) => 0;
         public int ApplyCrashPenalty(string playerId, GeoPoint at = default) => 0;
+        public bool TryDequeueStolenLumen(out StolenLumenRecord record)
+        {
+            record = default;
+            return false;
+        }
         public CrashTier GetCrashTier(string playerId) => CrashTier.NonLeader;
         public System.Collections.Generic.IEnumerable<(string playerId, int lumens)> OrderedStandings
             => System.Array.Empty<(string, int)>();
@@ -46,9 +53,12 @@ namespace LightRunners.Core
     public sealed class NullGateDirector : IGateDirector
     {
         public int ActiveGateCount => 0;
+        public int ActiveBonusGateCount => 0;
         public event Action<GateId, GeoPoint, GatePlacement> GateSpawned { add { } remove { } }
         public event Action<GateId> GateDespawned { add { } remove { } }
         public event Action<GateId, string> GateCollected { add { } remove { } }
+        public bool TryGetGatePosition(GateId id, out GeoPoint position) { position = default; return false; }
+        public bool TryCollectGate(GateId id, string collectorPlayerId) => false;
         public void ConfigureForPlayers(int playerCount, float gatesPerPlayer) { }
         public void PlaceBonusGate(GeoPoint at, GatePlacement placement, string refereeToken) { }
     }
@@ -62,14 +72,25 @@ namespace LightRunners.Core
         public GeoPoint Origin => default;
         public event Action<string> BoundaryViolated { add { } remove { } }
         public bool IsInside(GeoPoint point) => true;
+        public void CheckPlayer(string playerId, GeoPoint point) { }
+        public void ForgetPlayer(string playerId) { }
+        public void Clear() { }
     }
 
-    /// <summary>No-op <see cref="IMatchTransport"/>: never connects.</summary>
+    /// <summary>
+    /// Offline <see cref="IMatchTransport"/>: never connects, but completes a connect attempt
+    /// immediately with <c>false</c> so callers can enter solo play without waiting for their
+    /// network timeout.
+    /// </summary>
     public sealed class NullMatchTransport : IMatchTransport
     {
         public bool IsConnected => false;
-        public event Action<bool> ConnectionChanged { add { } remove { } }
-        public void ConnectMatch(string roomId, string localPlayerId) { }
+        public event Action<bool> ConnectionChanged;
+        public void ConnectMatch(string roomId, string localPlayerId)
+        {
+            ConnectionChanged?.Invoke(false);
+            GameEvents.RaiseConnectionStateChanged(false);
+        }
         public void Disconnect() { }
     }
 
@@ -101,5 +122,11 @@ namespace LightRunners.Core
             return false;
         }
         public void Unfreeze() { }
+    }
+
+    /// <summary>No-op <see cref="IStolenLumenSpawner"/>: dropped Lumens never re-enter play.</summary>
+    public sealed class NullStolenLumenSpawner : IStolenLumenSpawner
+    {
+        public void DrainAndSpawn() { }
     }
 }

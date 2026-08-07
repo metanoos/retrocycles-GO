@@ -7,7 +7,7 @@ namespace LightRunners.Afterglow
 {
     // ─── Track F: Afterglow Replay Sink ──────────────────────────────────────
     // Implements IMatchReplaySink (Core) on top of a ReplayPackage. Subscribes to
-    // GameEvents to capture Lumen/crash/expiry as a parallel observer. Decision U:
+    // GameEvents to observe match expiry. Decision U:
     // the resulting package is the one artifact the Overview and Walk-Inside both read.
 
     /// <summary>
@@ -41,19 +41,10 @@ namespace LightRunners.Afterglow
     /// on <c>GameEvents.MatchExpired</c>.
     ///
     /// Capture sources (decision documented per source):
-    ///   • Lumens: <see cref="GameEvents.LumensChanged"/> AND
-    ///     <see cref="GameEvents.GateCollected"/>. The latter carries gateId but NOT the
-    ///     collection point; we wait for the next LumensChanged for the same player to
-    ///     backfill, but also accept a direct <see cref="IMatchReplaySink.RecordLumen"/>
-    ///     call (Track D's authoritative path).
-    ///   • Crashes: <see cref="IMatchReplaySink.RecordCrash"/> is the proper contract and
-    ///     Track D calls it directly with full metadata. As a SAFETY NET we ALSO subscribe
-    ///     to <see cref="GameEvents.PlayerCrashed"/> — which carries ONLY a player id — to
-    ///     ensure no crash is lost if Track D's path is skipped. The bus fallback emits a
-    ///     partial crash (Tier = NonLeader, LumensDropped = 0, At = default) and is
-    ///     superseded by any subsequent full RecordCrash for the same player at the same
-    ///     timestamp. GAP NOTE for Track A: until a richer crash-event API exists, bus-only
-    ///     crashes cannot recover their tier/Lumens-dropped.
+    ///   • Lumens: the authoritative gameplay handler calls
+    ///     <see cref="IMatchReplaySink.RecordLumen"/> after the host accepts a collection.
+    ///   • Crashes: the authoritative gameplay handler calls
+    ///     <see cref="IMatchReplaySink.RecordCrash"/> after the host computes tier/drop metadata.
     ///   • Trail snapshots: <see cref="IMatchReplaySink.RecordTrailSnapshot"/> accepts
     ///     incremental snapshots during the match; at expiry, the sink also queries the
     ///     registered <see cref="TrailSnapshotProvider"/> for each known player so the
@@ -66,6 +57,7 @@ namespace LightRunners.Afterglow
         // Re-entrancy / double-finalize guard: MatchExpired can fire from multiple paths
         // (UI, host authoritative, late bus subscribers).
         private bool _finalized;
+        private bool _boundToEventBus;
 
         private readonly ReplayPackage _package;
 
@@ -138,9 +130,8 @@ namespace LightRunners.Afterglow
         }
 
         /// <summary>
-        /// Record one crash with full metadata (authoritative — Track D calls this from
-        /// <c>ILumenScoreboard.ApplyCrashPenalty</c>). The legacy event bus can't supply
-        /// tier/dropped; that fallback lives in <see cref="OnPlayerCrashed"/>.
+        /// Record one crash with full metadata (authoritative — Track D calls this after
+        /// <c>ILumenScoreboard.ApplyCrashPenalty</c>).
         /// </summary>
         public void RecordCrash(string playerId, GeoPoint at, double matchTimeSeconds, CrashTier tier, int lumensDropped)
         {
@@ -230,53 +221,22 @@ namespace LightRunners.Afterglow
         // would leak across scene loads (GameEvents explicitly does not auto-clear).
 
         /// <summary>
-        /// Subscribe to the GameEvents bus for Lumen/crash/expiry capture. Idempotent;
+        /// Subscribe to the GameEvents bus for match-expiry finalization. Idempotent;
         /// pair with <see cref="UnbindFromEventBus"/> on scene exit.
         /// </summary>
         public void BindToEventBus()
         {
-            GameEvents.LumensChanged += OnLumensChanged;
-            GameEvents.GateCollected += OnGateCollected;
+            if (_boundToEventBus) return;
             GameEvents.MatchExpired += OnMatchExpired;
-            GameEvents.PlayerCrashed += OnPlayerCrashed;
+            _boundToEventBus = true;
         }
 
         /// <summary>Unsubscribe from the GameEvents bus.</summary>
         public void UnbindFromEventBus()
         {
-            GameEvents.LumensChanged -= OnLumensChanged;
-            GameEvents.GateCollected -= OnGateCollected;
+            if (!_boundToEventBus) return;
             GameEvents.MatchExpired -= OnMatchExpired;
-            GameEvents.PlayerCrashed -= OnPlayerCrashed;
-        }
-
-        private void OnLumensChanged(string playerId, int newTotal)
-        {
-            // We don't have the lumen-collect point from this event (the tally fires from
-            // multiple sources). We record a lumen event only when we have a position,
-            // which arrives via RecordLumen (Track D). No-op here.
-        }
-
-        private void OnGateCollected(int gateIdValue, string collectorPlayerId)
-        {
-            // As with LumensChanged: no point available. The authoritative RecordLumen
-            // call from Track D's gate-collect handler is the canonical capture path.
-        }
-
-        private void OnPlayerCrashed(string playerId)
-        {
-            // GAP NOTE (Track A): GameEvents.PlayerCrashed carries ONLY a player id. We
-            // emit a partial crash record as a safety net; Track D's authoritative
-            // RecordCrash call (with tier + lumensDropped) supersedes it if it arrives
-            // later in the same frame. Until Track A exposes a richer crash event, bus-
-            // only crashes can't recover their tier or dropped-Lumen count.
-            if (_finalized || string.IsNullOrEmpty(playerId)) return;
-            _package.AddCrash(new CrashEvent(
-                playerId,
-                default,
-                CurrentMatchTimeSeconds(),
-                CrashTier.NonLeader,
-                lumensDropped: 0));
+            _boundToEventBus = false;
         }
 
         private void OnMatchExpired()
@@ -284,14 +244,5 @@ namespace LightRunners.Afterglow
             Freeze();
         }
 
-        /// <summary>
-        /// Best-effort match-relative time used when only the event bus fires (no
-        /// authoritative Record* call). Falls back to wall-clock seconds since match start.
-        /// </summary>
-        private double CurrentMatchTimeSeconds()
-        {
-            if (_package.MatchStartTimeUtc == default) return 0.0;
-            return (DateTime.UtcNow - _package.MatchStartTimeUtc).TotalSeconds;
-        }
     }
 }

@@ -42,10 +42,6 @@ namespace LightRunners.Afterglow
         [Tooltip("GameObject carrying the (future) Walk-Inside camera. Toggled on/off. May be null at milestone.")]
         [SerializeField] private GameObject walkInsideView;
 
-        [Header("Switching")]
-        [Tooltip("If true, switching Overview↔WalkInside uses an instant cut. Milestone: true.")]
-        [SerializeField] private bool cutSwitch = true;
-
         // Decision U — selection/focus preserved across switches.
         private readonly HashSet<string> _selectedPlayerIds = new HashSet<string>();
         private string _focusedPlayerId = string.Empty;
@@ -84,6 +80,39 @@ namespace LightRunners.Afterglow
 
         /// <summary>Backing stub used when switching to Walk-Inside at milestone (decision S).</summary>
         public WalkInsideStub WalkInsideStub { get; set; } = new WalkInsideStub();
+
+        /// <summary>
+        /// Resolve the scene-authored controller, including an inactive one, or build the
+        /// zero-art Overview stack at runtime. Older checked-in scenes predate Afterglow, and
+        /// generated scenes historically disabled the controller's whole root, so expiry must
+        /// not depend on active-only scene lookup.
+        /// </summary>
+        public static AfterglowViewController EnsureRuntimeInstance()
+        {
+            var controller = FindAnyObjectByType<AfterglowViewController>(FindObjectsInactive.Include);
+            if (controller == null)
+            {
+                var root = new GameObject("Afterglow");
+                controller = root.AddComponent<AfterglowViewController>();
+            }
+
+            if (!controller.gameObject.activeSelf)
+                controller.gameObject.SetActive(true);
+            controller.EnsureOverviewView();
+            controller.ApplyView();
+            return controller;
+        }
+
+        /// <summary>
+        /// Hide and clear the current replay if a runtime controller exists. Does not create a
+        /// stack. Continue/Run Again and defensive new-run entry use this lifecycle boundary so
+        /// the Overview camera cannot leak into Lobby or the next match.
+        /// </summary>
+        public static void ResetRuntimeInstance()
+        {
+            var controller = FindAnyObjectByType<AfterglowViewController>(FindObjectsInactive.Include);
+            if (controller != null) controller.Reset();
+        }
 
         // ─────────────────────────────────────────────────────────────────────
         // Selection / focus (decision U — preserved across switches)
@@ -175,6 +204,19 @@ namespace LightRunners.Afterglow
         // Internals
         // ─────────────────────────────────────────────────────────────────────
 
+        private void EnsureOverviewView()
+        {
+            if (overviewView != null) return;
+
+            overviewView = new GameObject("OverviewCamera");
+            overviewView.transform.SetParent(transform, false);
+            var camera = overviewView.AddComponent<Camera>();
+            camera.orthographic = true;
+            camera.enabled = false;
+            overviewView.AddComponent<OverviewCameraController>();
+            overviewView.SetActive(false);
+        }
+
         private void SwitchTo(AfterglowView next)
         {
             if (next == _currentView && _currentView != AfterglowView.None) return;
@@ -185,8 +227,7 @@ namespace LightRunners.Afterglow
         private void ApplyView()
         {
             // Mirrors ARViewManager.SetStackEnabled: enable the relevant GameObject stack.
-            // Milestone uses a cut (cutSwitch == true); a future fade would wrap these
-            // toggles in a coroutine that alpha-blends between the two stacks.
+            // Milestone uses a cut; a future fade would wrap these toggles in a coroutine.
             bool showOverview = _currentView == AfterglowView.Overview;
             bool showWalkInside = _currentView == AfterglowView.WalkInside;
 
