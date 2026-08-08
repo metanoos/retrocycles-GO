@@ -173,6 +173,8 @@ namespace LightRunners.Editor
             mainCam.tag = "MainCamera";
             var mainCamComp = mainCam.GetComponent<Camera>();
             mainCamComp.depth = 0;
+            mainCamComp.clearFlags = CameraClearFlags.SolidColor;
+            mainCamComp.backgroundColor = new Color(0.02f, 0.02f, 0.05f); // near-black
             mainCam.transform.position = new Vector3(0, 50, 0);
             mainCam.transform.rotation = Quaternion.Euler(90, 0, 0);
 

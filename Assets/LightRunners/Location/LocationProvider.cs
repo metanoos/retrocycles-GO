@@ -31,8 +31,8 @@ namespace LightRunners.Location
         [SerializeField] private double simStartLat = 37.7749;
         [SerializeField] private double simStartLon = -122.4194;
         [SerializeField] private double simStartAlt = 5.0;
-        [SerializeField] private float simWalkSpeed = 1.4f;   // m/s, brisk walk
-        [SerializeField] private float simSprintMultiplier = 3f;
+        [SerializeField] private float simWalkSpeed = 5f;     // m/s, boosted for editor testing
+        [SerializeField] private float simSprintMultiplier = 4f;
         [SerializeField] private float simTurnSpeed = 90f;    // deg/s
 
         private float _sampleTimer;
