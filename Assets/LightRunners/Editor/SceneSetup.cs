@@ -105,7 +105,11 @@ namespace LightRunners.Editor
             new GameObject("TrailManager", typeof(Trail.TrailManager));
             // BeaconFormManager (phase 5 — add by reflection if present)
             TryAddType("LightRunners.Beacon.BeaconFormManager", "BeaconFormManager");
-            // FusionLauncher (FUSION_WEAVER — phase 8)
+            // MirrorLauncher (free multiplayer — replaces Fusion). Mirror's NetworkManager
+            // is a MonoBehaviour so TryAddType creates it. The playerPrefab is wired below
+            // after the MirrorPlayer prefab is generated.
+            TryAddMirrorLauncher();
+            // FusionLauncher (FUSION_WEAVER — phase 8, legacy dead code)
             TryAddType("LightRunners.Multiplayer.FusionLauncher", "FusionLauncher");
             // SupabaseManager (phase 7)
             TryAddType("LightRunners.Backend.SupabaseManager", "SupabaseManager");
@@ -503,6 +507,48 @@ namespace LightRunners.Editor
             catch (Exception e)
             {
                 Debug.LogWarning($"[SceneSetup] Could not add {fullTypeName}: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Add the MirrorLauncher to the scene and wire its playerPrefab to the
+        /// MirrorPlayer prefab. If the prefab doesn't exist yet, creates the GO
+        /// anyway (the prefab can be wired later via the inspector).
+        /// </summary>
+        private static void TryAddMirrorLauncher()
+        {
+            try
+            {
+                Type launcherType = FindTypeByName("LightRunners.Multiplayer.MirrorLauncher");
+                if (launcherType == null || !launcherType.IsSubclassOf(typeof(MonoBehaviour)))
+                {
+                    Debug.Log("[SceneSetup] MirrorLauncher type not found — Mirror not installed.");
+                    return;
+                }
+
+                var go = new GameObject("MirrorLauncher");
+                var launcher = go.AddComponent(launcherType);
+
+                // Wire the playerPrefab if the MirrorPlayer prefab exists.
+                var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(
+                    "Assets/Resources/Player/MirrorPlayer.prefab");
+                if (prefab != null)
+                {
+                    var so = new SerializedObject(launcher);
+                    var prop = so.FindProperty("playerPrefab");
+                    if (prop != null) prop.objectReferenceValue = prefab;
+                    so.ApplyModifiedPropertiesWithoutUndo();
+                    Debug.Log("[SceneSetup] MirrorLauncher wired with MirrorPlayer prefab.");
+                }
+                else
+                {
+                    Debug.LogWarning("[SceneSetup] MirrorLauncher created but MirrorPlayer.prefab not found. " +
+                                     "Run Light-Runners → Setup → Mirror Player Prefab first.");
+                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[SceneSetup] Could not add MirrorLauncher: {e.Message}");
             }
         }
 

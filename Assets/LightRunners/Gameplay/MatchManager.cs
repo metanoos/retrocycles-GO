@@ -455,12 +455,20 @@ namespace LightRunners.Gameplay
 
         private void PublishFrozenConfigToNetwork()
         {
-#if FUSION_WEAVER
-            var networkState = FindAnyObjectByType<LightRunners.Multiplayer.NetworkMatchState>();
+            // Mirror: resolve the MirrorNetworkMatchState from the scene and publish
+            // the frozen tail radius. Uses reflection so Gameplay doesn't take a
+            // hard dependency on the Multiplayer assembly.
+            var networkState = FindAnyObjectByType(
+                System.Type.GetType("LightRunners.Multiplayer.MirrorNetworkMatchState, LightRunners.Multiplayer"));
             if (networkState != null)
-                networkState.HostSetFrozenTailRadius(
-                    (_tailAuthority?.FrozenConfig ?? FrozenMatchConfig.Default).TailRadiusMeters);
-#endif
+            {
+                var method = networkState.GetType().GetMethod("HostSetFrozenTailRadius");
+                if (method != null)
+                {
+                    float radius = (_tailAuthority?.FrozenConfig ?? FrozenMatchConfig.Default).TailRadiusMeters;
+                    method.Invoke(networkState, new object[] { radius });
+                }
+            }
         }
 
         /// <summary>Decision M — configure the gate pool for the live player count.</summary>

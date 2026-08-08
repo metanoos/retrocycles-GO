@@ -53,31 +53,15 @@ namespace LightRunners.Editor
             Debug.Log("[PrefabSetup] Beacon prefabs generated under " + BeaconDir);
         }
 
-        [MenuItem("Light-Runners/Setup/NetworkPlayer Prefab")]
+        /// <summary>
+        /// Legacy Fusion prefab generation. Fusion 2 is a paid SDK that is no longer
+        /// used (Mirror replaced it). This method is kept as a no-op for menu compat.
+        /// Use GenerateMirrorPlayerPrefab instead.
+        /// </summary>
+        [MenuItem("Light-Runners/Setup/NetworkPlayer Prefab (Legacy Fusion)")]
         public static void GenerateNetworkPlayerPrefab()
         {
-#if FUSION_WEAVER
-            if (!AssetDatabase.IsValidFolder(NetworkPlayerDir))
-            {
-                Directory.CreateDirectory(NetworkPlayerDir);
-                AssetDatabase.Refresh();
-            }
-            const string path = NetworkPlayerDir + "/NetworkPlayer.prefab";
-            if (File.Exists(path)) return;
-
-            var go = new GameObject("NetworkPlayer");
-            // Spec §14.3: minimal prefab = NetworkObject + NetworkPlayer + NetworkTrailSync.
-            // Do NOT add beacon/collision components here — Spawned builds those at runtime.
-            // Added by reflection so this file compiles before Fusion is imported.
-            AddComponentByName(go, "Fusion.NetworkObject");
-            AddComponentByName(go, "LightRunners.Multiplayer.NetworkPlayer");
-            AddComponentByName(go, "LightRunners.Multiplayer.NetworkTrailSync");
-            PrefabUtility.SaveAsPrefabAsset(go, path);
-            UnityEngine.Object.DestroyImmediate(go);
-            Debug.Log("[PrefabSetup] NetworkPlayer prefab generated at " + path);
-#else
-            Debug.Log("[PrefabSetup] Skipped NetworkPlayer prefab — FUSION_WEAVER not defined. (Phase 8.)");
-#endif
+            Debug.Log("[PrefabSetup] Fusion NetworkPlayer prefab skipped — use Mirror Player Prefab instead.");
         }
 
         /// <summary>
@@ -118,30 +102,14 @@ namespace LightRunners.Editor
         ///
         /// Generated only under <c>FUSION_WEAVER</c>. Idempotent.
         /// </summary>
-        [MenuItem("Light-Runners/Setup/NetworkMatchState Prefab")]
+        /// <summary>
+        /// Legacy Fusion NetworkMatchState prefab. Fusion 2 is a paid SDK that is no longer
+        /// used (Mirror replaced it). This method is kept as a no-op for menu compat.
+        /// </summary>
+        [MenuItem("Light-Runners/Setup/NetworkMatchState Prefab (Legacy Fusion)")]
         public static void GenerateNetworkMatchStatePrefab()
         {
-#if FUSION_WEAVER
-            if (!AssetDatabase.IsValidFolder(NetworkPlayerDir))
-            {
-                Directory.CreateDirectory(NetworkPlayerDir);
-                AssetDatabase.Refresh();
-            }
-            const string path = NetworkPlayerDir + "/NetworkMatchState.prefab";
-            if (File.Exists(path)) return;
-
-            var go = new GameObject("NetworkMatchState");
-            // Spec §14.3 + decision Q: minimal prefab = NetworkObject + NetworkMatchState.
-            // AddComponentByName reflection so the file compiles before Fusion is imported
-            // and before Track C's Multiplayer assembly is merged.
-            AddComponentByName(go, "Fusion.NetworkObject");
-            AddComponentByName(go, "LightRunners.Multiplayer.NetworkMatchState");
-            PrefabUtility.SaveAsPrefabAsset(go, path);
-            UnityEngine.Object.DestroyImmediate(go);
-            Debug.Log("[PrefabSetup] NetworkMatchState prefab generated at " + path);
-#else
-            Debug.Log("[PrefabSetup] Skipped NetworkMatchState prefab — FUSION_WEAVER not defined. (Track C, decision Q.)");
-#endif
+            Debug.Log("[PrefabSetup] Fusion NetworkMatchState prefab skipped — Mirror handles state via SyncVar.");
         }
 
         /// <summary>
