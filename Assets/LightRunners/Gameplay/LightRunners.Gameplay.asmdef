@@ -10,7 +10,9 @@
         "LightRunners.Backend",
         "LightRunners.Identity",
         "UnityEngine.UI",
-        "LightRunners.Multiplayer"
+        "LightRunners.Multiplayer",
+        "LightRunners.Lightfield",
+        "LightRunners.Afterglow"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],

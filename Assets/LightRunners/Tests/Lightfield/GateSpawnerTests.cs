@@ -23,6 +23,9 @@ namespace LightRunners.Lightfield.Tests
             public GeoPoint Origin { get; set; } = new GeoPoint(37.0, -122.0, 0);
             public event Action<string> BoundaryViolated { add { } remove { } }
             public bool IsInside(GeoPoint point) => true; // every sample is in-bounds
+            public void CheckPlayer(string playerId, GeoPoint point) { }
+            public void ForgetPlayer(string playerId) { }
+            public void Clear() { }
         }
 
         /// <summary>
@@ -50,7 +53,11 @@ namespace LightRunners.Lightfield.Tests
         }
 
         [TearDown]
-        public void TearDown() => _spawner?.Dispose();
+        public void TearDown()
+        {
+            _spawner?.Dispose();
+            GameEvents.ClearSubscribersForTests();
+        }
 
         // ── ConfigureForPlayers spawns the formula-correct count ────────────
         [Test]
@@ -150,10 +157,16 @@ namespace LightRunners.Lightfield.Tests
         {
             _spawner.ConfigureForPlayers(playerCount: 2, gatesPerPlayer: 0.5f);
             int density = _spawner.ActiveGateCount;
+            Assert.AreEqual(0, _spawner.ActiveBonusGateCount, "no bonus gates before PlaceBonusGate");
 
             _spawner.PlaceBonusGate(new GeoPoint(37.001, -122.001, 0), GatePlacement.Ground, "ref-token-1");
 
-            Assert.AreEqual(density + 1, _spawner.ActiveGateCount, "bonus gate must add on top of the density pool");
+            // Round-2 fix R2-F8: ActiveGateCount is DENSITY-ONLY per the IGateDirector contract
+            // (Round-1 fix R1-F10). A bonus gate must NOT inflate ActiveGateCount; it must show
+            // up in ActiveBonusGateCount. The prior test asserted the OLD combined-count behavior
+            // and would have passed against a regression that re-combined them.
+            Assert.AreEqual(density, _spawner.ActiveGateCount, "bonus gate must NOT inflate density count");
+            Assert.AreEqual(1, _spawner.ActiveBonusGateCount, "bonus gate must show in ActiveBonusGateCount");
         }
 
         [Test]
@@ -182,9 +195,9 @@ namespace LightRunners.Lightfield.Tests
         public void PlaceBonusGate_NotReplacedOnCollect()
         {
             _spawner.ConfigureForPlayers(playerCount: 2, gatesPerPlayer: 0.5f);
+            int density = _spawner.ActiveGateCount;
             _spawner.PlaceBonusGate(new GeoPoint(37.001, -122.001, 0), GatePlacement.Ground, "ref-token-1");
-
-            int withBonus = _spawner.ActiveGateCount;
+            Assert.AreEqual(1, _spawner.ActiveBonusGateCount, "bonus gate active");
 
             // Find the bonus gate (its id is >= BonusGateIdBase).
             GateId bonus = default;
@@ -196,7 +209,35 @@ namespace LightRunners.Lightfield.Tests
             Assert.IsTrue(found, "bonus gate must be tracked as active");
             _spawner.CollectGate(bonus, "p2");
 
-            Assert.AreEqual(withBonus - 1, _spawner.ActiveGateCount, "bonus gate is one-shot — must NOT be replaced");
+            // Round-2 fix R2-F8: bonus gate is one-shot (no respawn), so ActiveBonusGateCount
+            // drops to 0; density count is UNCHANGED (the bonus collect doesn't trigger respawn).
+            Assert.AreEqual(0, _spawner.ActiveBonusGateCount, "bonus gate is one-shot — gone after collect");
+            Assert.AreEqual(density, _spawner.ActiveGateCount, "density count unchanged by bonus collect");
+        }
+
+        /// <summary>
+        /// Round-2 fix R2-F8: pin the density-respawn behavior separately from the bonus one-shot.
+        /// A density-gate collect must preserve ActiveGateCount (respawn) and leave
+        /// ActiveBonusGateCount untouched.
+        /// </summary>
+        [Test]
+        public void DensityGate_RespawnsOnCollect_BonusUntouched()
+        {
+            _spawner.ConfigureForPlayers(playerCount: 2, gatesPerPlayer: 0.5f);
+            int density = _spawner.ActiveGateCount; // = max(1, ceil(2*0.5)) = 1
+            _spawner.PlaceBonusGate(new GeoPoint(37.001, -122.001, 0), GatePlacement.Ground, "ref-token-1");
+            Assert.AreEqual(1, _spawner.ActiveBonusGateCount);
+
+            // Collect a DENSITY gate (first non-bonus).
+            GateId densityGate = default;
+            foreach (var s in _spawner.ActiveGates)
+            {
+                if (!s.IsBonus) { densityGate = s.Id; break; }
+            }
+            _spawner.CollectGate(densityGate, "p1");
+
+            Assert.AreEqual(density, _spawner.ActiveGateCount, "density gate respawns — count preserved");
+            Assert.AreEqual(1, _spawner.ActiveBonusGateCount, "bonus unaffected by density collect");
         }
 
         // ── Bonus vs density id ranges don't collide ───────────────────────
@@ -216,23 +257,39 @@ namespace LightRunners.Lightfield.Tests
             Assert.GreaterOrEqual(minBonus, GateSpawner.BonusGateIdBase);
         }
 
-        // ── HookGameEvents routes static bus to CollectGate ────────────────
+        // ── Accepted collection is the only static score/replay signal ─────
         [Test]
-        public void HookGameEvents_StaticBusCollect_RoutesIntoSpawner()
+        public void TryCollectGate_Accepted_RaisesStaticBusOnce()
         {
             _spawner.ConfigureForPlayers(playerCount: 2, gatesPerPlayer: 0.5f);
-            _spawner.HookGameEvents();
-            try
+            int accepted = 0;
+            GateId observed = default;
+            GameEvents.GateCollected += (id, collector, at) =>
             {
-                var first = FirstActiveGateId(_spawner);
-                GameEvents.RaiseGateCollected(first.Value, "p-collector");
-                // Density gate collected → respawned; count unchanged.
-                Assert.AreEqual(1, _spawner.ActiveGateCount);
-            }
-            finally
-            {
-                _spawner.UnhookGameEvents();
-            }
+                accepted++;
+                observed = new GateId(id);
+            };
+
+            var first = FirstActiveGateId(_spawner);
+            Assert.IsTrue(_spawner.TryCollectGate(first, "p-collector"));
+
+            Assert.AreEqual(1, accepted);
+            Assert.AreEqual(first, observed);
+        }
+
+        [Test]
+        public void TryCollectGate_StaleId_DoesNotRaiseAcceptedBus()
+        {
+            _spawner.ConfigureForPlayers(playerCount: 2, gatesPerPlayer: 0.5f);
+            int accepted = 0;
+            GameEvents.GateCollected += (id, collector, at) => accepted++;
+
+            var first = FirstActiveGateId(_spawner);
+            Assert.IsTrue(_spawner.TryCollectGate(first, "p-collector"));
+            Assert.IsFalse(_spawner.TryCollectGate(first, "p-collector"),
+                "the destroyed visual's stale id must be rejected");
+
+            Assert.AreEqual(1, accepted, "only the first authoritative consumption is accepted");
         }
 
         // ── Sampler fallback when out-of-bounds ────────────────────────────
@@ -258,6 +315,9 @@ namespace LightRunners.Lightfield.Tests
             public GeoPoint Origin { get; set; } = new GeoPoint(37.0, -122.0, 0);
             public event Action<string> BoundaryViolated { add { } remove { } }
             public bool IsInside(GeoPoint point) => false; // sampler never succeeds
+            public void CheckPlayer(string playerId, GeoPoint point) { }
+            public void ForgetPlayer(string playerId) { }
+            public void Clear() { }
         }
 
         private sealed class FixedPointSampler : IGatePositionSampler

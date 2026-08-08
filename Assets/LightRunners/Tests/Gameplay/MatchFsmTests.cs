@@ -23,7 +23,6 @@ namespace LightRunners.Gameplay.Tests
         private readonly List<MatchState> _transitions = new List<MatchState>();
         private readonly List<(MatchState, MatchState)> _busTransitions = new List<(MatchState, MatchState)>();
         private bool _expiredFired;
-        private bool _tailWasFrozenOnBus;
 
         [SetUp]
         public void SetUp()
@@ -50,8 +49,6 @@ namespace LightRunners.Gameplay.Tests
             _transitions.Clear();
             _busTransitions.Clear();
             _expiredFired = false;
-            _tailWasFrozenOnBus = false;
-
             _match.StateChanged += (prev, next) => _transitions.Add(next);
             GameEvents.MatchStateChanged += OnBusTransition;
             GameEvents.MatchExpired += OnExpired;
@@ -166,6 +163,19 @@ namespace LightRunners.Gameplay.Tests
         }
 
         [Test]
+        public void EndMatch_DuringCountdown_StillFinalizesAndExpires()
+        {
+            _match.BeginMatch();
+            Assert.AreEqual(MatchState.Countdown, _match.State);
+
+            _match.EndMatch();
+
+            Assert.AreEqual(MatchState.Expired, _match.State);
+            Assert.IsTrue(_expiredFired);
+            Assert.IsTrue(_match.MatchId.Length > 0, "early expiry keeps the replay identity");
+        }
+
+        [Test]
         public void HandleCrash_OutsideLive_IsNoOp()
         {
             // Pre-Live (e.g. Countdown): a crash event must not apply penalties.
@@ -177,12 +187,96 @@ namespace LightRunners.Gameplay.Tests
             Assert.AreEqual(before, after, "Crash outside Live should be a no-op on the tally");
         }
 
+        [Test]
+        public void DisconnectedTransport_IsSoloAuthority_ButConnectedClientIsNot()
+        {
+            var transport = new FakeMatchTransport { IsConnected = false, IsHost = false };
+            ServiceLocator.Register<IMatchTransport>(transport);
+            Assert.IsTrue(_match.IsHostAuthority,
+                "a dormant/failed Fusion transport must not disable solo match authority");
+
+            transport.IsConnected = true;
+            Assert.IsFalse(_match.IsHostAuthority,
+                "a connected non-host peer must not mutate authoritative match state");
+        }
+
+        [Test]
+        public void NullTransport_ConnectCompletesOfflineImmediately()
+        {
+            var transport = new NullMatchTransport();
+            bool typedCompletion = true;
+            bool busCompletion = true;
+            transport.ConnectionChanged += online => typedCompletion = online;
+            System.Action<bool> busObserver = online => busCompletion = online;
+            GameEvents.ConnectionStateChanged += busObserver;
+
+            try
+            {
+                transport.ConnectMatch("offline-room", "local-player");
+
+                Assert.IsFalse(typedCompletion,
+                    "the typed transport surface must complete immediately as offline");
+                Assert.IsFalse(busCompletion,
+                    "GameManager's connection bus must complete immediately as offline");
+            }
+            finally
+            {
+                GameEvents.ConnectionStateChanged -= busObserver;
+            }
+        }
+
+        [Test]
+        public void RegisteredZeroLumenPlayer_IsIncludedInFinishOrder()
+        {
+            _match.BeginMatch();
+            _match.RegisterPlayer("runner-zero");
+
+            var method = typeof(MatchManager).GetMethod("ComputeFinishOrder",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            Assert.IsNotNull(method);
+            var order = (System.Collections.Generic.IReadOnlyList<string>)method.Invoke(_match, null);
+
+            CollectionAssert.Contains((System.Collections.ICollection)order, "runner-zero");
+        }
+
+        [Test]
+        public void AcceptedGateCollection_AwardsExactlyOnceAndRejectsStaleId()
+        {
+            _match.TestBeginMatchAtLive();
+            var director = ServiceLocator.Get<IGateDirector>();
+            Assert.IsNotNull(director);
+            GateId spawned = default;
+            director.GateSpawned += (id, at, placement) => spawned = id;
+            director.ConfigureForPlayers(1, 1f);
+            Assert.Greater(spawned.Value, 0);
+
+            // Capture the original id BEFORE collecting — density-gate respawn fires
+            // GateSpawned again, which would overwrite `spawned` with the new gate's id.
+            GateId staleId = spawned;
+
+            Assert.IsTrue(director.TryCollectGate(staleId, "runner-gate"));
+            Assert.AreEqual(1, _match.Scoreboard.GetLumens("runner-gate"));
+
+            Assert.IsFalse(director.TryCollectGate(staleId, "runner-gate"));
+            Assert.AreEqual(1, _match.Scoreboard.GetLumens("runner-gate"),
+                "a deferred-destroy stale visual must not award a second Lumen");
+        }
+
         private static bool InvokeValidator(MatchState from, MatchState to)
         {
             var method = typeof(MatchManager).GetMethod("ValidateTransition",
                 System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
             Assert.IsNotNull(method, "ValidateTransition must exist on MatchManager");
             return (bool)method.Invoke(null, new object[] { from, to });
+        }
+
+        public sealed class FakeMatchTransport : IMatchTransport
+        {
+            public bool IsConnected { get; set; }
+            public bool IsHost { get; set; }
+            public event System.Action<bool> ConnectionChanged { add { } remove { } }
+            public void ConnectMatch(string roomId, string localPlayerId) { }
+            public void Disconnect() { IsConnected = false; }
         }
     }
 }

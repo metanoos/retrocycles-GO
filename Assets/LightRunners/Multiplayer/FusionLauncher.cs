@@ -73,6 +73,20 @@ namespace LightRunners.Multiplayer
         /// </summary>
         public event Action<bool> ConnectionChanged;
 
+        protected override void Awake()
+        {
+            base.Awake();
+            // Register before the first connect. Waiting until TryStart succeeds creates a
+            // bootstrap deadlock because GameManager can only reach TryStart through this slot.
+            RegisterAsTransport();
+        }
+
+        protected override void OnDestroy()
+        {
+            UnregisterAsTransport();
+            base.OnDestroy();
+        }
+
         /// <summary>
         /// Connect (Host Mode) into <paramref name="roomId"/> as the local player
         /// <paramref name="localPlayerId"/>. Replaces the legacy
@@ -84,6 +98,7 @@ namespace LightRunners.Multiplayer
         /// </summary>
         public void ConnectMatch(string roomId, string localPlayerId)
         {
+            RegisterAsTransport();
             Connect(roomId, localPlayerId, onComplete: null);
         }
 
@@ -143,6 +158,18 @@ namespace LightRunners.Multiplayer
                     GameMode = GameMode.Host,
                     SessionName = roomName,
                     PlayerCount = cfg.maxPlayersPerRoom,
+                    // Round-1 review fix R2-F6: enable Photon host migration + a non-zero
+                    // empty-room TTL so a brief host disconnect doesn't orphan every client.
+                    // Full migration of the Lightfield match state (NetworkMatchState re-spawn,
+                    // Lumen tally continuity, gate pool re-authority) is decision-S-deferred
+                    // scope, but silent orphaning is not acceptable — EnableHostMigration at
+                    // least keeps the room alive for a reconnect attempt.
+                    EnableHostMigration = true,
+                    CustomPhotonRoomParams = new Photon.Realtime.RoomOptions
+                    {
+                        EmptyRoomTtl = cfg.lobbyIdleTimeoutSeconds * 1000, // ms; matches lobby TTL (pitfall §17.14)
+                        PlayerTtl = cfg.lobbyIdleTimeoutSeconds * 1000,
+                    },
                     // AppId/app-version live in PhotonAppSettings.asset (spec §8.1).
                 });
 
@@ -164,7 +191,6 @@ namespace LightRunners.Multiplayer
         public async void Disconnect()
         {
             CurrentRoomName = null;
-            UnregisterAsTransport();
             if (_runner != null)
             {
                 var r = _runner;
@@ -249,9 +275,36 @@ namespace LightRunners.Multiplayer
             if (runner != _runner && _runner != null) return; // stale runner from a retry
             _runner = null;
             CurrentRoomName = null;
-            UnregisterAsTransport();
+            // Round-1 review fix R2-F6: warn loudly if we shut down mid-match — previously this
+            // was silent, and clients would continue with a stale scoreboard until they timed
+            // out. The match state is gone; surface it so the UI can prompt return-to-lobby.
+            if (ServiceLocator.TryGet<IMatchSession>(out var session) && session != null
+                && (session.State == MatchState.Live || session.State == MatchState.Countdown
+                    || session.State == MatchState.Warmup || session.State == MatchState.Scoring))
+            {
+                Debug.LogWarning($"[FusionLauncher] Connection lost mid-match (state={session.State}, reason={shutdownReason}). Host migration did not complete; match state is no longer authoritative. Returning to solo/offline mode.");
+            }
             RaiseConnected(false);
             CompleteConnect(false);
+        }
+
+        /// <summary>
+        /// Round-1 review fix R2-F6: was empty. Photon signals host migration here; for the
+        /// ground-only milestone we DON'T fully migrate the Lightfield match state (decision-S
+        /// deferral), but we MUST at least log the event so the failure isn't silent and re-spawn
+        /// NetworkMatchState on the new host so frozen-tail-radius replication can resume. Full
+        /// migration (Lumen tally continuity, gate pool re-authority, replay sink handoff) is a
+        /// follow-up tracked in SPEC §1.5 decision-Q row.
+        /// </summary>
+        public void OnHostMigration(NetworkRunner runner, HostMigrationToken hostMigrationToken)
+        {
+            Debug.LogWarning($"[FusionLauncher] Host migration in progress. New host: {runner.IsServer}. " +
+                             "Lightfield match state migration is partial (decision-S deferral): NetworkMatchState " +
+                             "will respawn on the new host; Lumen tally continuity is NOT guaranteed. " +
+                             "If you see scoreboard desync post-migration, end the match and restart.");
+            // The new host's OnPlayerJoined path will spawn NetworkMatchState; existing clients
+            // will receive it via Fusion's networked-object replication. No further action here
+            // for the milestone.
         }
 
         // Unused callbacks (interface completeness).
@@ -264,7 +317,9 @@ namespace LightRunners.Multiplayer
         public void OnUserSimulationMessage(NetworkRunner runner, SimulationMessagePtr message) { }
         public void OnSessionListUpdated(NetworkRunner runner, List<SessionInfo> sessionList) { }
         public void OnCustomAuthenticationResponse(NetworkRunner runner, Dictionary<string, object> data) { }
-        public void OnHostMigration(NetworkRunner runner, HostMigrationToken hostMigrationToken) { }
+        // OnHostMigration has a real implementation above (Round-1 R2-F6 fix) — the empty stub
+        // that used to live here was deleted in Round 2 (R2-F3): it duplicated the real method
+        // and was a CS0111 compile error whenever FUSION_WEAVER was defined.
         public void OnReliableDataReceived(NetworkRunner runner, PlayerRef player, ReliableKey key, ArraySegment<byte> data) { }
         public void OnReliableDataProgress(NetworkRunner runner, PlayerRef player, ReliableKey key, float progress) { }
         public void OnObjectExitAOI(NetworkRunner runner, NetworkObject obj, PlayerRef player) { }

@@ -14,6 +14,7 @@ namespace LightRunners.Location
         [SerializeField, Range(0f, 1f)] private float lowBatteryThreshold = 0.15f;
 
         public float CurrentSampleInterval { get; private set; } = 0.5f;
+        public float LowBatteryThreshold => lowBatteryThreshold;
 
         private bool _isBackgrounded;
 

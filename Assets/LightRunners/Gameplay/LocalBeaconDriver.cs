@@ -2,6 +2,7 @@ using UnityEngine;
 using LightRunners.Core;
 using LightRunners.Location;
 using LightRunners.Beacon;
+using LightRunners.Lightfield;
 
 namespace LightRunners.Gameplay
 {
@@ -46,6 +47,23 @@ namespace LightRunners.Gameplay
             go.transform.SetParent(transform, false);
             _beacon = go.AddComponent<BeaconController>();
             go.AddComponent<BeaconEffects>();
+
+            // Round-1 review fix R2-F7: wire LocalRunnerIdentity + "Runner" tag + a trigger
+            // collider so LumenGate / StolenLumenPickup OnTriggerEnter can resolve the collector.
+            // Without this, every gate collection credits player id "unknown" and corrupts the
+            // leaderboard, Afterglow finish order, and Decision-I crown. A small SphereCollider
+            // stands in for the runner's "body" for trigger purposes (the AR camera itself has no
+            // physics body). For the Fusion path (NetworkPlayer owns the avatar), the equivalent
+            // wiring is a documented follow-up on first Fusion SDK import.
+            var identity = go.AddComponent<LocalRunnerIdentity>();
+            if (GameManager.HasInstance && !string.IsNullOrEmpty(GameManager.Instance.LocalPlayerId))
+                identity.SetPlayerId(GameManager.Instance.LocalPlayerId);
+            var bodyCollider = go.AddComponent<SphereCollider>();
+            bodyCollider.isTrigger = true;
+            bodyCollider.radius = FrozenMatchConfig.Default.PlayerHeadRadiusMeters;
+            var body = go.AddComponent<Rigidbody>();
+            body.isKinematic = true;
+            body.useGravity = false;
 
             var form = GameManager.HasInstance ? GameManager.Instance.CurrentForm : BeaconFormType.Hoverboard;
             _beacon.SetForm(form);

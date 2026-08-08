@@ -258,30 +258,50 @@ namespace LightRunners.Afterglow.Tests
         }
 
         [Test]
-        public void Sink_PartialCrash_WhenOnlyEventBusFires()
+        public void Sink_TypedCrashBus_UsesSingleAuthoritativeReplayRecord()
         {
-            // IMatchReplaySink crash-metadata gap note: if Track D never calls RecordCrash
-            // for a player, the sink should still record a partial crash from the legacy
-            // PlayerCrashed event bus. We simulate the bus call by invoking the private
-            // handler indirectly through GameEvents.RaisePlayerCrashed.
+            // PlayerCrashed carries collision identity and position, while MatchManager owns
+            // penalty tier/drop calculation and calls RecordCrash with the complete record.
+            // The replay observer must not capture the bus signal independently or the one
+            // authoritative crash would appear twice.
             var pkg = new ReplayPackage("m1", DateTime.UtcNow, default);
             var sink = new ReplayPackageSink(pkg);
+            var crashSite = MetersToGeo(5, 10, 2);
+            PlayerCrashEvent observed = default;
+            int busEvents = 0;
+            Action<PlayerCrashEvent> observer = crash =>
+            {
+                observed = crash;
+                busEvents++;
+            };
+
+            GameEvents.PlayerCrashed += observer;
             sink.BindToEventBus();
             try
             {
-                GameEvents.RaisePlayerCrashed("p3");
+                GameEvents.RaisePlayerCrashed("p3", "p2", crashSite);
+
+                Assert.AreEqual(1, busEvents, "typed crash event must fire exactly once");
+                Assert.AreEqual("p3", observed.CrashedPlayerId);
+                Assert.AreEqual("p2", observed.CausedByPlayerId);
+                Assert.AreEqual(crashSite, observed.At);
+                Assert.AreEqual(0, pkg.Crashes.Count,
+                    "the bus signal alone must not create a partial replay duplicate");
+
+                sink.RecordCrash("p3", crashSite, 4.25, CrashTier.Leader, 2);
             }
             finally
             {
                 sink.UnbindFromEventBus();
+                GameEvents.PlayerCrashed -= observer;
             }
 
-            Assert.AreEqual(1, pkg.Crashes.Count, "PlayerCrashed bus event must produce a partial crash");
+            Assert.AreEqual(1, pkg.Crashes.Count, "one crash must produce one authoritative replay record");
             Assert.AreEqual("p3", pkg.Crashes[0].PlayerId);
-            Assert.AreEqual(CrashTier.NonLeader, pkg.Crashes[0].Tier,
-                "tier defaults to NonLeader when bus lacks tier info (Track A gap note)");
-            Assert.AreEqual(0, pkg.Crashes[0].LumensDropped,
-                "Lumens-dropped defaults to 0 when bus lacks drop info (Track A gap note)");
+            Assert.AreEqual(crashSite, pkg.Crashes[0].At);
+            Assert.AreEqual(4.25, pkg.Crashes[0].TimeSeconds, 1e-9);
+            Assert.AreEqual(CrashTier.Leader, pkg.Crashes[0].Tier);
+            Assert.AreEqual(2, pkg.Crashes[0].LumensDropped);
         }
 
         [Test]
@@ -308,6 +328,21 @@ namespace LightRunners.Afterglow.Tests
 
             Assert.IsTrue(pkg1.IsFrozen, "sink1 should freeze on MatchExpired");
             Assert.IsTrue(pkg2.IsFrozen, "sink2 should freeze on MatchExpired");
+        }
+
+        [Test]
+        public void Sink_BindIsIdempotent_AndSingleUnbindDetaches()
+        {
+            var pkg = new ReplayPackage("m-bind", DateTime.UtcNow, default);
+            var sink = new ReplayPackageSink(pkg);
+
+            sink.BindToEventBus();
+            sink.BindToEventBus();
+            sink.UnbindFromEventBus();
+            GameEvents.RaiseMatchExpired();
+
+            Assert.IsFalse(pkg.IsFrozen,
+                "binding twice must not leave a hidden subscription after one unbind");
         }
     }
 }

@@ -4,6 +4,10 @@ using UnityEngine;
 using LightRunners.Core;
 using LightRunners.Identity;
 using LightRunners.Trail;
+using LightRunners.Afterglow;
+using LightRunners.Backend;
+using LightRunners.Lightfield;
+using LightRunners.Location;
 
 namespace LightRunners.Gameplay
 {
@@ -51,12 +55,13 @@ namespace LightRunners.Gameplay
     {
         // ─── Inspector ──────────────────────────────────────────────────────
         [Header("Respawn (decision F — crash is no longer terminal)")]
-        [Tooltip("Respawn offset (metres) from the crash site along the runner's last heading. Default 5m back.")]
+        [Tooltip("Minimum horizontal distance (metres) the runner must move away from the crash site before collision rearms.")]
         [SerializeField] private float respawnBackOffsetMeters = 5f;
         [Tooltip("Brief invulnerability (s) after a respawn so the trailing-into-own-tail case can't instantly re-crash.")]
         [SerializeField] private float respawnGraceSeconds = 2f;
 
         // ─── IMatchSession surface ──────────────────────────────────────────
+        public string MatchId => _replaySink?.Package?.MatchId ?? string.Empty;
         public MatchState State { get; private set; } = MatchState.Idle;
         public float TimeRemaining { get; private set; }
 
@@ -72,6 +77,11 @@ namespace LightRunners.Gameplay
             {
                 if (ServiceLocator.TryGet<IMatchTransport>(out var transport) && transport != null)
                 {
+                    // A failed/timed-out/disconnected transport means this process is running
+                    // the documented solo fallback. It must remain authoritative locally even
+                    // when a dormant FusionLauncher still owns the locator slot.
+                    if (!transport.IsConnected) return true;
+
                     // The concrete FusionLauncher (Track C) exposes `bool IsHost`. We can't
                     // reference that type here without taking a Multiplayer dependency from a
                     // property getter, so resolve reflectively — the contract is documented in
@@ -104,18 +114,59 @@ namespace LightRunners.Gameplay
         private double _countdownStartedAt = -1.0;
         private string _localPlayerId;
         private readonly HashSet<string> _knownPlayers = new HashSet<string>();
-        private float _respawnGraceUntil = -1f;
+        private readonly Dictionary<string, float> _respawnReadyAt = new Dictionary<string, float>();
+        private readonly List<string> _readyRespawns = new List<string>();
+        private GeoPoint _localRespawnSite;
+        private bool _hasLocalRespawnSite;
+        private Guid _backendMatchId;
+        private bool _persistenceSubmitted;
 
         // Scoreboard / tail authority are constructed here (Track A impls land in integration).
         private LumenScoreboard _scoreboard;
         private TailAuthority _tailAuthority;
         private SnakeTailModel _snakeTailModel;
+        // Track B gate director + lightfield volume — constructed in Awake (Round-2 fix R2-F1).
+        private LightfieldVolume _lightfieldVolume;
+        private GateSpawner _gateDirector;
+        // Track F replay sink — constructed in Awake (Round-1 review fix).
+        private ReplayPackageSink _replaySink;
 
         /// <summary>Match-relative time in seconds (0 outside a live match).</summary>
         private double MatchClockSeconds()
         {
             if (_matchStartEpochSeconds < 0) return 0.0;
             return Time.timeAsDouble - _matchStartEpochSeconds;
+        }
+
+        /// <summary>
+        /// Resolve a referee-token validator Func for the GateSpawner (Round-2 fix R2-F8). Returns
+        /// a delegate that calls <c>RefereeTokenValidator.Validate(token, matchId, secret)</c> if
+        /// the Multiplayer assembly + type is reachable; falls back to a non-empty check otherwise.
+        /// Reflective so this call site doesn't depend on FUSION_WEAVER at compile time.
+        /// </summary>
+        private static Func<string, bool> ResolveRefereeTokenValidator()
+        {
+            try
+            {
+                var t = System.Type.GetType("LightRunners.Multiplayer.RefereeTokenValidator, LightRunners.Multiplayer");
+                if (t == null) return null; // GateSpawner substitutes its default non-empty check.
+                var validate = t.GetMethod("Validate", new[] { typeof(string), typeof(string), typeof(string) });
+                if (validate == null) return null;
+                // The validator needs (token, matchId, secret). MatchId is known once a match
+                // starts; secret comes from the host. For the milestone we resolve both lazily on
+            // each call: matchId from the registered IMatchSession if available, secret from a
+                // host-side config field. If secret is unset, fail-closed (return false) so a
+                // misconfigured host can't mint tokens.
+                return token =>
+                {
+                    if (string.IsNullOrEmpty(token)) return false;
+                    string matchId = ServiceLocator.Get<IMatchSession>()?.MatchId;
+                    string secret = GameConfig.Active.refereeTokenSecret;
+                    if (string.IsNullOrEmpty(secret)) return false; // fail-closed
+                    return (bool)validate.Invoke(null, new object[] { token, matchId ?? string.Empty, secret });
+                };
+            }
+            catch { return null; }
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -133,11 +184,45 @@ namespace LightRunners.Gameplay
             ServiceLocator.Register<ILumenScoreboard>(_scoreboard);
             ServiceLocator.Register<ITailAuthority>(_tailAuthority);
 
+            // Construct & register the real Track B impls (Round-2 review fix R2-F1: previously
+            // MatchManager.Awake registered only LumenScoreboard/TailAuthority/IMatchSession/
+            // IMatchReplaySink — but NOT IGateDirector or ILightfieldVolume. The Null* stubs from
+            // PlatformServiceRegistry remained live, so ConfigureForPlayers and CheckPlayer were
+            // no-ops. The entire gate/Lumen loop was dead in production despite the Round-1 fix
+            // claims. Construct both here and set the Lightfield origin from the local GPS.
+            _lightfieldVolume = new LightfieldVolume();
+            _lightfieldVolume.BoundaryViolated += OnBoundaryViolated;
+            if (LocationProvider.HasInstance)
+                _lightfieldVolume.SetOrigin(LocationProvider.Instance.CurrentPosition);
+            ServiceLocator.Register<ILightfieldVolume>(_lightfieldVolume);
+            // Round-2 fix R2-F8: inject a referee-token validator into the GateSpawner so
+            // PlaceBonusGate validates the token regardless of caller (Round-1 fix added the
+            // ctor param but the production construction site used the default non-empty check).
+            // The validator resolves the host-issued secret from a RefereeTokenValidator
+            // (Multiplayer) — looked up reflectively so Gameplay doesn't take a hard Multiplayer
+            // type dependency at this call site (the asmdef already references Multiplayer for
+            // the gated Fusion blocks; reflective keeps the validator optional at runtime).
+            _gateDirector = new GateSpawner(_lightfieldVolume, refereeTokenValidator: ResolveRefereeTokenValidator());
+            ServiceLocator.Register<IGateDirector>(_gateDirector);
+
+            // Construct & register the real Track F replay sink (Round-1 review fix F1: this was
+            // never constructed, so the locator kept NullMatchReplaySink and Afterglow was always
+            // empty). Gameplay references Afterglow directly now (asmdef updated) so we can drop
+            // the prior reflection-based lookup.
+            ResetReplaySink();
+
+            // Keep the generated scene reproducible, but do not require regeneration for a
+            // normal checkout: mount the two runtime presenters when they are absent.
+            if (FindAnyObjectByType<LumenGateVisualizer>() == null)
+                gameObject.AddComponent<LumenGateVisualizer>();
+            if (FindAnyObjectByType<StolenLumenPickupSpawner>() == null)
+                gameObject.AddComponent<StolenLumenPickupSpawner>();
+
             // Register self as the match session (overwrites NullMatchSession).
             ServiceLocator.Register<IMatchSession>(this);
 
             // Subscribe to the static bus (mirrors GameManager's pattern; we never reference
-            // Multiplayer / Backend / Afterglow directly — those assemblies push events here).
+            // Multiplayer / Backend directly — those assemblies push events here).
             // NOTE: we deliberately do NOT subscribe to GameEvents.PlayerCrashed — that would
             // double-handle with GameManager.OnPlayerCrashed, which is the single crash listener
             // and calls MatchManager.HandlePlayerCrash directly with the crash GeoPoint. The
@@ -146,14 +231,45 @@ namespace LightRunners.Gameplay
             GameEvents.GateCollected += OnBusGateCollected;
         }
 
-        protected virtual void OnDestroy()
+        protected override void OnDestroy()
         {
             GameEvents.ConnectionStateChanged -= OnBusConnectionStateChanged;
             GameEvents.GateCollected -= OnBusGateCollected;
+            if (_lightfieldVolume != null)
+                _lightfieldVolume.BoundaryViolated -= OnBoundaryViolated;
+            try { _gateDirector?.Dispose(); } catch { /* idempotent */ }
+            try { _replaySink?.UnbindFromEventBus(); } catch { /* idempotent */ }
+            RestoreNullServicesIfOwned();
+            base.OnDestroy();
+        }
+
+        private void RestoreNullServicesIfOwned()
+        {
+            if (ReferenceEquals(ServiceLocator.Get<IMatchSession>(), this))
+                ServiceLocator.Register<IMatchSession>(new NullMatchSession());
+            if (ReferenceEquals(ServiceLocator.Get<ILumenScoreboard>(), _scoreboard))
+                ServiceLocator.Register<ILumenScoreboard>(new NullLumenScoreboard());
+            if (ReferenceEquals(ServiceLocator.Get<ITailAuthority>(), _tailAuthority))
+                ServiceLocator.Register<ITailAuthority>(new NullTailAuthority());
+            if (ReferenceEquals(ServiceLocator.Get<IGateDirector>(), _gateDirector))
+                ServiceLocator.Register<IGateDirector>(new NullGateDirector());
+            if (ReferenceEquals(ServiceLocator.Get<ILightfieldVolume>(), _lightfieldVolume))
+                ServiceLocator.Register<ILightfieldVolume>(new NullLightfieldVolume());
+            if (ReferenceEquals(ServiceLocator.Get<IMatchReplaySink>(), _replaySink))
+                ServiceLocator.Register<IMatchReplaySink>(new NullMatchReplaySink());
+        }
+
+        private void ResetReplaySink()
+        {
+            try { _replaySink?.UnbindFromEventBus(); } catch { /* idempotent */ }
+            _replaySink = new ReplayPackageSink();
+            _replaySink.BindToEventBus();
+            ServiceLocator.Register<IMatchReplaySink>(_replaySink);
         }
 
         private void Update()
         {
+            CompleteReadyRespawns();
             if (State == MatchState.Countdown)
             {
                 float remaining = Mathf.Max(0f,
@@ -203,16 +319,30 @@ namespace LightRunners.Gameplay
             // Resolve local player + reset state.
             _localPlayerId = ResolveLocalPlayerId();
             _knownPlayers.Clear();
-            if (!string.IsNullOrEmpty(_localPlayerId)) _knownPlayers.Add(_localPlayerId);
+            _respawnReadyAt.Clear();
+            _lightfieldVolume?.Clear();
+            RegisterPlayer(_localPlayerId);
             if (_scoreboard != null) _scoreboard.Reset();
             if (_tailAuthority != null) _tailAuthority.Unfreeze();
-            _respawnGraceUntil = -1f;
+            if (_lightfieldVolume != null && LocationProvider.HasInstance)
+                _lightfieldVolume.SetOrigin(LocationProvider.Instance.CurrentPosition);
+            ResetReplaySink();
+            _hasLocalRespawnSite = false;
+            PrepareBackendMatchPersistence();
 
             TransitionTo(MatchState.Warmup);
 
             // Auto-advance into Countdown immediately for the milestone. A real Warmup screen
             // would wait on a host "ready" signal; the milestone ships the simplest viable flow.
             TransitionTo(MatchState.Countdown);
+        }
+
+        public void RegisterPlayer(string playerId)
+        {
+            if (string.IsNullOrEmpty(playerId)) return;
+            bool added = _knownPlayers.Add(playerId);
+            if (added && State == MatchState.Live && IsHostAuthority)
+                ConfigureGatesForLive();
         }
 
         /// <summary>
@@ -272,6 +402,7 @@ namespace LightRunners.Gameplay
                     // Brief scoring pass; for the milestone we collapse straight into Expired.
                     // (A real implementation waits a frame for late Lumen events.)
                     FinalizeReplayPackage();
+                    SubmitBackendMatchResultsOrDefer();
                     break;
 
                 case MatchState.Expired:
@@ -335,10 +466,77 @@ namespace LightRunners.Gameplay
         /// <summary>Decision M — configure the gate pool for the live player count.</summary>
         private void ConfigureGatesForLive()
         {
-            int players = Mathf.Max(1, _knownPlayers.Count);
+            int players = _knownPlayers.Count;
+            if (TrailManager.HasInstance)
+            {
+                foreach (string playerId in TrailManager.Instance.AllTrails.Keys)
+                    if (!string.IsNullOrEmpty(playerId)) _knownPlayers.Add(playerId);
+                players = Mathf.Max(players, TrailManager.Instance.LivePlayerCount);
+            }
+            players = Mathf.Max(1, players);
             float gatesPerPlayer = GameConfig.Active.gatesPerPlayer;
             if (ServiceLocator.TryGet<IGateDirector>(out var director) && director != null)
                 director.ConfigureForPlayers(players, gatesPerPlayer);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Backend match persistence
+        // ─────────────────────────────────────────────────────────────────────
+
+        private void PrepareBackendMatchPersistence()
+        {
+            _backendMatchId = Guid.Empty;
+            _persistenceSubmitted = false;
+
+            if (_replaySink == null) return;
+            if (!Guid.TryParse(_replaySink.Package.MatchId, out Guid desiredMatchId))
+            {
+                Debug.LogError($"[MatchManager] Replay match id is not a UUID: {_replaySink.Package.MatchId}");
+                return;
+            }
+            // Keep the replay UUID as the eventual backend identity, but do not create an open
+            // server row mid-match. Expiry submits one durable transaction that creates, writes,
+            // and closes the match; an app kill before expiry therefore leaves no orphan row.
+            _backendMatchId = desiredMatchId;
+        }
+
+        private void SubmitBackendMatchResultsOrDefer()
+        {
+            if (_persistenceSubmitted || !IsHostAuthority || !PlayerRepository.HasInstance)
+                return;
+            if (_backendMatchId == Guid.Empty) return;
+
+            _persistenceSubmitted = true;
+            var finishOrder = ComputeFinishOrder();
+            var results = new List<MatchResultWrite>(finishOrder.Count);
+            int previousLumens = int.MinValue;
+            int currentRank = 0;
+            for (int i = 0; i < finishOrder.Count; i++)
+            {
+                string playerId = finishOrder[i];
+                int lumens = _scoreboard?.GetLumens(playerId) ?? 0;
+                if (i == 0 || lumens != previousLumens) currentRank = i + 1;
+                previousLumens = lumens;
+                string role = playerId == _localPlayerId ? "host" : "runner";
+                results.Add(new MatchResultWrite(playerId, lumens, currentRank, role));
+            }
+
+            // A tied maximum has no single winner. LumenScoreboard exposes empty in that case;
+            // do not promote the deterministic replay tiebreaker into an authoritative winner.
+            string winnerPlayerId = _scoreboard?.LeaderPlayerId ?? string.Empty;
+            int durationSeconds = Math.Max(0, (int)Math.Round(MatchClockSeconds()));
+            string roomId = GameManager.HasInstance
+                ? GameManager.Instance.ResolveRoomName()
+                : string.Empty;
+            PlayerRepository.Instance.FinalizeMatchWithResults(
+                _backendMatchId,
+                roomId,
+                _localPlayerId,
+                results,
+                winnerPlayerId,
+                durationSeconds,
+                onSuccess: null,
+                onError: error => Debug.LogWarning($"[MatchManager] finalize_match failed: {error}"));
         }
 
         private void ExpireMatch()
@@ -358,8 +556,10 @@ namespace LightRunners.Gameplay
             }
             else if (State == MatchState.Warmup || State == MatchState.Countdown)
             {
-                // Early expire (host forfeit before live): the transition table permits these
-                // states to go directly to Expired. No package to finalize in this case.
+                // Early host forfeit still closes the replay/backend row. The FSM may skip the
+                // public Scoring state, but finalization semantics remain exactly-once.
+                FinalizeReplayPackage();
+                SubmitBackendMatchResultsOrDefer();
                 TransitionTo(MatchState.Expired);
             }
         }
@@ -376,8 +576,13 @@ namespace LightRunners.Gameplay
         /// </summary>
         public void HandlePlayerCrash(string playerId, GeoPoint at)
         {
-            if (State != MatchState.Live) return;
+            if (State != MatchState.Live || !IsHostAuthority) return;
             if (string.IsNullOrEmpty(playerId)) return;
+            // A runner remains crashed until its grace window completes. Ignore duplicate
+            // detector/RPC signals during that window so one physical collision cannot apply
+            // multiple penalties or emit multiple replay records.
+            if (_respawnReadyAt.ContainsKey(playerId)) return;
+            RegisterPlayer(playerId);
 
             CrashTier tier = CrashTier.NonLeader;
             int dropped = 0;
@@ -400,24 +605,77 @@ namespace LightRunners.Gameplay
                 dropped = _scoreboard.ApplyCrashPenalty(playerId, at);
             }
 
-            // Closes Track F's crash-metadata gap: full RecordCrash with tier + dropped Lumens,
-            // superseding the partial record the sink's PlayerCrashed fallback emits.
+            // Record the one authoritative crash after its penalty metadata is known.
             if (ServiceLocator.TryGet<IMatchReplaySink>(out var sink) && sink != null)
             {
                 sink.RecordCrash(playerId, at, MatchClockSeconds(), tier, dropped);
             }
 
-            // Respawn the runner (decision F). For the milestone we mark a grace window; the
-            // concrete respawn (reset the trail / teleport the avatar) is wired by GameManager in
-            // response to a RespawnRequested event so this class stays free of TrailManager /
-            // avatar concerns.
-            _respawnGraceUntil = Time.time + respawnGraceSeconds;
+            // Drain dropped-Lumen pickups (Round-1 review fix R1-F2/R2-F3): the scoreboard enqueues
+            // a StolenLumenRecord per crash; the gameplay layer drains it and renders the
+            // stealable pickups at the crash site. Previously nothing drained the queue, so
+            // dropped Lumens never re-entered play AND the queue leaked memory for the match.
+            if (dropped > 0)
+            {
+                try { ServiceLocator.Get<IStolenLumenSpawner>()?.DrainAndSpawn(); }
+                catch (Exception e) { Debug.LogException(e); }
+            }
+
+            // Begin respawn. GameManager marks a trail discontinuity immediately; collision
+            // stays disabled until the grace time and physical clearance checks both pass.
+            float readyAt = Time.time + respawnGraceSeconds;
+            _respawnReadyAt[playerId] = readyAt;
+            if (playerId == _localPlayerId)
+            {
+                _localRespawnSite = at;
+                _hasLocalRespawnSite = true;
+            }
             try { RespawnRequested?.Invoke(playerId, at); }
             catch (Exception e) { Debug.LogException(e); }
         }
 
-        /// <summary>True while the local runner is in the post-respawn invulnerability window.</summary>
-        public bool IsLocalRunnerInvulnerable => _respawnGraceUntil > 0f && Time.time < _respawnGraceUntil;
+        private void CompleteReadyRespawns()
+        {
+            if (_respawnReadyAt.Count == 0) return;
+            _readyRespawns.Clear();
+            foreach (var entry in _respawnReadyAt)
+            {
+                if (Time.time < entry.Value) continue;
+                if (entry.Key == _localPlayerId && !HasLocalRunnerReachedRespawnClearance())
+                    continue;
+                _readyRespawns.Add(entry.Key);
+            }
+
+            foreach (string playerId in _readyRespawns)
+            {
+                _respawnReadyAt.Remove(playerId);
+                if (playerId == _localPlayerId) _hasLocalRespawnSite = false;
+                GameEvents.RaisePlayerRespawned(playerId);
+            }
+        }
+
+        private bool HasLocalRunnerReachedRespawnClearance()
+        {
+            if (!_hasLocalRespawnSite || !LocationProvider.HasInstance) return true;
+            FrozenMatchConfig frozen = _tailAuthority?.FrozenConfig ?? FrozenMatchConfig.Default;
+            float requiredMeters = Mathf.Max(
+                respawnBackOffsetMeters,
+                frozen.HeadToTrailCollisionMeters + 1f);
+            return HasReachedRespawnClearance(
+                _localRespawnSite,
+                LocationProvider.Instance.CurrentPosition,
+                requiredMeters);
+        }
+
+        internal static bool HasReachedRespawnClearance(GeoPoint crashSite, GeoPoint current, float requiredMeters)
+            => current.HorizontalDistanceTo(crashSite) >= Math.Max(0f, requiredMeters);
+
+        /// <summary>
+        /// True from the crash until both the grace time and safe horizontal clearance have
+        /// been reached. Remaining still at the collision site cannot trigger a chain crash.
+        /// </summary>
+        public bool IsLocalRunnerInvulnerable
+            => !string.IsNullOrEmpty(_localPlayerId) && _respawnReadyAt.ContainsKey(_localPlayerId);
 
         // ─────────────────────────────────────────────────────────────────────
         // GameEvents subscribers
@@ -430,19 +688,40 @@ namespace LightRunners.Gameplay
             if (online) _localPlayerId = ResolveLocalPlayerId();
         }
 
-        private void OnBusGateCollected(int gateIdValue, string collectorPlayerId)
+        private void OnBoundaryViolated(string playerId)
         {
-            // Track A's scoreboard awards +1 Lumen on every GateCollected bus event (it
-            // subscribes itself). We use this signal only to grow the known-player roster.
-            if (!string.IsNullOrEmpty(collectorPlayerId)) _knownPlayers.Add(collectorPlayerId);
+            if (State == MatchState.Live && IsHostAuthority)
+                GameEvents.RaiseBoundaryViolated(playerId);
+        }
 
-            // Forward the lumen record to the replay sink with the gate's position when we can
-            // resolve it. The IGateDirector contract doesn't expose per-gate positions; the
-            // concrete GateSpawner (Track B) keeps an ActiveGates snapshot, but resolving that
-            // from the interface would need a cast. We accept the missing position for the
-            // milestone (RecordLumen with a default point is still better than skipping).
+        private void OnBusGateCollected(int gateIdValue, string collectorPlayerId, GeoPoint at)
+        {
+            // Round-2 fix R2-F7: guard on Live state. Without this, a stray physics
+            // OnTriggerEnter in the window between ExpireMatch and the gate GameObjects being
+            // destroyed would still mutate the authoritative tally — breaking Decision O's
+            // "most Lumens wins on expiry" invariant.
+            if (State != MatchState.Live || !IsHostAuthority) return;
+
+            // Round-1 review fix F3/R2-F1: the prior implementation only grew the roster and
+            // forwarded to the replay sink — it NEVER called scoreboard.Award, so the Lumen
+            // tally stayed at zero forever in any runtime path that didn't go through a Fusion
+            // host RPC. The doc-comment claiming "Track A's scoreboard awards on every
+            // GateCollected" was false. Award +1 Lumen here, on every collection, offline or
+            // online. The host-side NetworkPlayer validates network requests and raises this
+            // event; it does not mutate the scoreboard itself, keeping this as the sole award
+            // site.
+            if (string.IsNullOrEmpty(collectorPlayerId)) return;
+            RegisterPlayer(collectorPlayerId);
+
+            if (_scoreboard != null)
+                _scoreboard.Award(collectorPlayerId);
+            else
+                ServiceLocator.Get<ILumenScoreboard>()?.Award(collectorPlayerId);
+
+            // The collection position travels with the event. Looking it up here is too late:
+            // GateSpawner removes the collected gate before later bus subscribers run.
             if (ServiceLocator.TryGet<IMatchReplaySink>(out var sink) && sink != null)
-                sink.RecordLumen(collectorPlayerId, default, MatchClockSeconds());
+                sink.RecordLumen(collectorPlayerId, at, MatchClockSeconds());
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -450,90 +729,32 @@ namespace LightRunners.Gameplay
         // ─────────────────────────────────────────────────────────────────────
 
         /// <summary>
-        /// Push finish order + tail radius into the replay package and freeze it. Resolves the
-        /// concrete <c>ReplayPackageSink</c> by interface-name (it lives in LightRunners.Afterglow
-        /// which Gameplay does reference indirectly via Core; we set its public delegate fields
-        /// by reflection so we don't take a hard reference). Safe to call multiple times — the
-        /// sink itself is idempotent.
+        /// Push finish order + tail radius into the replay package and freeze it. Round-1 review
+        /// fix R1-F13: previously resolved the sink via reflection-by-interface-name (fragile — a
+        /// rename would silently null-out the lookup at runtime, not compile time). Gameplay now
+        /// references Afterglow directly, so we use the typed locator and set the sink's public
+        /// fields directly. Safe to call multiple times — the sink itself is idempotent.
         /// </summary>
         private void FinalizeReplayPackage()
         {
-            object sink = ServiceLocator.GetByInterfaceName("LightRunners.Core.IMatchReplaySink");
-            if (sink == null) return;
+            if (_replaySink == null) return;
 
             // Wire the per-player trail-snapshot provider (decision U — closes Track F's gap).
-            // The concrete ReplayPackageSink declares its own delegate types
-            // (TrailSnapshotProviderDelegate / LivePlayerEnumeratorDelegate) which are NOT
-            // assignment-compatible with Func<...>; build matching delegates of the exact field
-            // type so reflection SetValue succeeds.
-            BindDelegate(sink, "TrailSnapshotProvider",
-                typeof(MatchManager).GetMethod(nameof(BuildTrailSnapshot),
-                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance));
-            BindDelegate(sink, "LivePlayerEnumerator",
-                typeof(MatchManager).GetMethod(nameof(LivePlayersForReplay),
-                    System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance));
+            _replaySink.TrailSnapshotProvider = BuildTrailSnapshot;
+            _replaySink.LivePlayerEnumerator = LivePlayersForReplay;
 
             // Exact frozen collision contract (decision T) and finish order are plain fields.
             FrozenMatchConfig frozen = _tailAuthority?.FrozenConfig ?? FrozenMatchConfig.Default;
-            SetFieldValue(sink, "FrozenTailRadius", frozen.TailRadiusMeters);
-            SetFieldValue(sink, "FrozenPlayerHeadRadiusCm", FrozenMatchConfig.PlayerHeadRadiusCm);
-            SetFieldValue(sink, "FrozenConfigHash", frozen.Hash);
+            _replaySink.FrozenTailRadius = frozen.TailRadiusMeters;
+            _replaySink.FrozenPlayerHeadRadiusCm = FrozenMatchConfig.PlayerHeadRadiusCm;
+            _replaySink.FrozenConfigHash = frozen.Hash;
+            if (_lightfieldVolume != null)
+                _replaySink.Package.SetOrigin(_lightfieldVolume.Origin);
             var order = ComputeFinishOrder();
-            if (order != null) SetFieldValue(sink, "FinishOrder", order);
-        }
-
-        /// <summary>
-        /// Create a delegate of the field's exact declared type wrapping <paramref name="method"/>
-        /// on this MatchManager instance. Required because Track F's sink declares its own
-        /// delegate types (LivePlayerEnumeratorDelegate returns IEnumerable&lt;string&gt; but is
-        /// a distinct type from Func&lt;IEnumerable&lt;string&gt;&gt;).
-        /// </summary>
-        private void BindDelegate(object target, string fieldName, System.Reflection.MethodInfo method)
-        {
-            if (target == null || method == null) return;
-            try
-            {
-                var f = target.GetType().GetField(fieldName);
-                if (f == null) return;
-                var del = Delegate.CreateDelegate(f.FieldType, this, method, throwOnBindFailure: false);
-                if (del != null) f.SetValue(target, del);
-            }
-            catch (Exception e) { Debug.LogWarning($"[MatchManager] bind {fieldName} failed: {e.Message}"); }
-        }
-
-        private static void SetDelegateField(object target, string fieldName, Delegate value)
-        {
-            if (target == null) return;
-            try
-            {
-                var f = target.GetType().GetField(fieldName);
-                if (f != null) f.SetValue(target, value);
-            }
-            catch (Exception e) { Debug.LogWarning($"[MatchManager] wire {fieldName} failed: {e.Message}"); }
-        }
-
-        private static void SetFieldValue(object target, string fieldName, object value)
-        {
-            if (target == null) return;
-            try
-            {
-                var f = target.GetType().GetField(fieldName);
-                if (f == null) return;
-
-                Type fieldType = f.FieldType;
-                Type valueType = value?.GetType();
-
-                // Strip Nullable<T> so we can pass a plain T into a float? / int? field (Track F's
-                // ReplayPackageSink.FrozenTailRadius is float?).
-                Type underlying = Nullable.GetUnderlyingType(fieldType);
-                if (underlying != null) fieldType = underlying;
-
-                if (value == null || fieldType.IsAssignableFrom(valueType) || fieldType == valueType)
-                    f.SetValue(target, value);
-                else
-                    Debug.LogWarning($"[MatchManager] {fieldName} type mismatch: field={f.FieldType.Name} value={valueType?.Name}");
-            }
-            catch (Exception e) { Debug.LogWarning($"[MatchManager] set {fieldName} failed: {e.Message}"); }
+            if (order != null) _replaySink.FinishOrder = order;
+            // Freeze before MatchExpired observers run so UI/Afterglow always see a complete,
+            // immutable package regardless of static-event subscription order.
+            _replaySink.Freeze();
         }
 
         /// <summary>
@@ -572,9 +793,25 @@ namespace LightRunners.Gameplay
         private IReadOnlyList<string> ComputeFinishOrder()
         {
             if (_scoreboard == null) return null;
-            var players = new List<string>(_knownPlayers);
-            players.Sort((a, b) => _scoreboard.GetLumens(b).CompareTo(_scoreboard.GetLumens(a)));
-            return players;
+            // Round-1 review fix R2-F11 (second half): previously sorted _knownPlayers (a HashSet,
+            // no insertion order) by Lumens alone — ties got an arbitrary order that was then
+            // written into the Afterglow replay's FinishOrder, surfacing as "I tied with my friend
+            // but the replay showed them above me." Now derive from OrderedStandings (deterministic
+            // tiebreak by playerId asc); include only known players for the snapshot.
+            var known = new HashSet<string>(_knownPlayers);
+            if (TrailManager.HasInstance)
+                foreach (string playerId in TrailManager.Instance.AllTrails.Keys)
+                    if (!string.IsNullOrEmpty(playerId)) known.Add(playerId);
+            var result = new List<string>();
+            foreach ((string pid, int _) in _scoreboard.OrderedStandings)
+                if (known.Contains(pid)) result.Add(pid);
+            // Append any known players not on the scoreboard (zero Lumens, never awarded) in a
+            // deterministic order so the FinishOrder length matches _knownPlayers.
+            foreach (var pid in result) known.Remove(pid);
+            var zeroScorePlayers = new List<string>(known);
+            zeroScorePlayers.Sort(StringComparer.Ordinal);
+            result.AddRange(zeroScorePlayers);
+            return result;
         }
 
         // ─────────────────────────────────────────────────────────────────────

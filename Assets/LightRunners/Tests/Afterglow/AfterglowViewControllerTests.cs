@@ -96,6 +96,25 @@ namespace LightRunners.Afterglow.Tests
         }
 
         [Test]
+        public void EnsureRuntimeInstance_ActivatesInactiveRootAndBuildsOverview()
+        {
+            _host.SetActive(false);
+
+            var ctrl = AfterglowViewController.EnsureRuntimeInstance();
+
+            Assert.AreSame(_host.GetComponent<AfterglowViewController>(), ctrl);
+            Assert.IsTrue(_host.activeSelf, "expiry must revive a generated inactive root");
+            var overview = _host.GetComponentInChildren<OverviewCameraController>(true);
+            Assert.IsNotNull(overview, "older scenes must receive the zero-art Overview stack");
+
+            var empty = new ReplayPackage("runtime-overview", DateTime.UtcNow, default);
+            empty.Freeze();
+            ctrl.ShowOverview(empty);
+            Assert.IsTrue(overview.gameObject.activeSelf);
+            Assert.IsTrue(overview.IsShown);
+        }
+
+        [Test]
         public void SelectPlayer_TogglesMembership()
         {
             var ctrl = NewController();

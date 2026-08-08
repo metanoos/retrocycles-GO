@@ -93,6 +93,8 @@ namespace LightRunners.Core
     /// </summary>
     public interface IMatchSession
     {
+        /// <summary>Stable identifier for the current match/replay package.</summary>
+        string MatchId { get; }
         MatchState State { get; }
         /// <summary>Seconds remaining on the live clock; meaningless outside Live/Scoring.</summary>
         float TimeRemaining { get; }
@@ -101,6 +103,8 @@ namespace LightRunners.Core
         /// <summary> Fires on any MatchState transition (also re-raised on GameEvents.MatchStateChanged).</summary>
         event Action<MatchState, MatchState> StateChanged;
 
+        /// <summary>Register a participant with the host roster even before they score.</summary>
+        void RegisterPlayer(string playerId);
         void BeginMatch();
         void EndMatch();
     }
@@ -130,6 +134,12 @@ namespace LightRunners.Core
         /// </summary>
         int ApplyCrashPenalty(string playerId, GeoPoint at = default);
 
+        /// <summary>
+        /// Dequeue one authoritative crash-drop record for presentation. Keeping this on the
+        /// Core contract avoids a Lightfield→Trail assembly dependency.
+        /// </summary>
+        bool TryDequeueStolenLumen(out StolenLumenRecord record);
+
         /// <summary>Tier for crash-penalty purposes (decision F).</summary>
         CrashTier GetCrashTier(string playerId);
 
@@ -148,10 +158,33 @@ namespace LightRunners.Core
     /// </summary>
     public interface IGateDirector
     {
+        /// <summary>
+        /// Count of ACTIVE BASELINE (density-spawned) gates currently in play — bonus/referee
+        /// gates are excluded. Round-1 review fix R1-F10: previously this included bonus gates,
+        /// which broke <c>ValidateGateCollectHost</c>'s id-range bound (bonus ids start at
+        /// 1_000_000 and were always out-of-range).
+        /// </summary>
         int ActiveGateCount { get; }
+        /// <summary>Count of referee-placed bonus gates currently active (decision R).</summary>
+        int ActiveBonusGateCount { get; }
         event Action<GateId, GeoPoint, GatePlacement> GateSpawned;
         event Action<GateId> GateDespawned;
         event Action<GateId, string> GateCollected;    // (gateId, collectorPlayerId)
+
+        /// <summary>
+        /// Look up a gate's authoritative position. Used by host-side gate-collect validation
+        /// (Round-1 fix R1-F9 / R2-F8: distance check) and by the replay sink to record where
+        /// each Lumen was collected (Round-1 fix R1-F15). Returns false for unknown /
+        /// already-collected ids.
+        /// </summary>
+        bool TryGetGatePosition(GateId id, out GeoPoint position);
+
+        /// <summary>
+        /// Atomically accept and consume an active gate. Returns false for stale/unknown ids or
+        /// an invalid collector. Only an accepted collection raises the cross-assembly
+        /// <c>GameEvents.GateCollected</c> notification used for score and replay mutation.
+        /// </summary>
+        bool TryCollectGate(GateId id, string collectorPlayerId);
 
         /// <summary>Initialize the gate pool to max(1, ceil(playerCount × gatesPerPlayer)). Decision M.</summary>
         void ConfigureForPlayers(int playerCount, float gatesPerPlayer);
@@ -176,6 +209,12 @@ namespace LightRunners.Core
         bool IsInside(GeoPoint point);
         /// <summary>Raised host-side when a runner crosses the boundary; idempotent per crossing.</summary>
         event Action<string> BoundaryViolated;        // playerId
+        /// <summary>Feed one authoritative player position into boundary transition tracking.</summary>
+        void CheckPlayer(string playerId, GeoPoint point);
+        /// <summary>Forget a departed player's transition state.</summary>
+        void ForgetPlayer(string playerId);
+        /// <summary>Reset all transition state between matches.</summary>
+        void Clear();
     }
 
     /// <summary>
@@ -229,7 +268,7 @@ namespace LightRunners.Core
         /// <summary>Validated collision and clearance values derived from the selected tail and fixed 2 m player radius.</summary>
         FrozenMatchConfig FrozenConfig { get; }
         bool IsFrozen { get; }
-        /// <summary>Host-only: freeze the radius at its current value. No-op once frozen.</summary>
+        /// <summary>Host-only: freeze the radius at its local config value. No-op once frozen.</summary>
         void FreezeAtCountdown();
         /// <summary>Validate and freeze the local host config. Invalid settings leave the authority unfrozen.</summary>
         bool TryFreezeAtCountdown(out string error);
@@ -237,5 +276,20 @@ namespace LightRunners.Core
         bool TryApplyNetworkedFreeze(int tailRadiusCm, uint configHash, out string error);
         /// <summary>Reset to unfrozen (called between matches).</summary>
         void Unfreeze();
+    }
+
+    /// <summary>
+    /// Spawns stealable-Lumen pickups at crash sites (decision F). The authoritative queue of
+    /// dropped Lumens lives on <see cref="ILumenScoreboard"/>; this spawner drains it and
+    /// renders + lifetime-manages the pickups. Implemented by
+    /// <c>LightRunners.Lightfield.StolenLumenPickupSpawner</c>; the Gameplay layer resolves it
+    /// from the <see cref="ServiceLocator"/> so it doesn't take a hard Lightfield reference at
+    /// every call site. Round-1 review fix: the spawner existed but was never wired into a
+    /// scene; MatchManager now triggers it on crash.
+    /// </summary>
+    public interface IStolenLumenSpawner
+    {
+        /// <summary>Spawn pickups for any records the scoreboard has queued. Called on crash.</summary>
+        void DrainAndSpawn();
     }
 }

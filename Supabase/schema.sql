@@ -747,39 +747,68 @@ create policy match_players_read on public.match_players for select using (
 -- Migration: lumen-scoreboard — match lifecycle RPCs (all SECURITY DEFINER).
 -- Mirror the lobby RPC pattern (raise exception '<token>'; client surfaces the
 -- token verbatim via LobbyServices.ErrorToken). Tokens: not_authenticated,
--- not_host, not_found, bad_role.
+-- not_host, not_found, bad_role, bad_lumens, bad_finish_rank.
 -- ─────────────────────────────────────────────────────────────────────────────
 
--- create_match — host calls this when the match begins (IMatchSession.BeginMatch).
--- Inserts a matches row + a host match_players row; returns the match id.
+-- create_match — idempotent host-bound creation helper. The runtime calls it inside
+-- finalize_match_with_results so no open row exists mid-match; retaining a separate helper keeps
+-- the authority check reusable and makes stable-UUID retries explicit.
+-- Drop the former two-argument signature so an upgraded database cannot retain
+-- an authority-bypassing overload; the default keeps two-argument calls working.
+drop function if exists public.create_match(text, text);
 create or replace function public.create_match(
     p_room_id text,
-    p_host_player_id text
+    p_host_player_id text,
+    p_match_id uuid default gen_random_uuid()
 )
 returns uuid
 language plpgsql security definer set search_path = public
 as $$
 declare
     v_uid uuid := auth.uid();
-    v_match_id uuid;
 begin
     if v_uid is null then raise exception 'not_authenticated'; end if;
+    if p_host_player_id is distinct from v_uid::text then
+        raise exception 'not_host';
+    end if;
 
-    insert into public.matches (room_id)
-    values (p_room_id)
-    returning id into v_match_id;
+    insert into public.matches (id, room_id)
+    values (p_match_id, p_room_id)
+    on conflict (id) do nothing;
+
+    -- RpcWithRetry may repeat a request whose first transaction committed but whose response
+    -- was lost. Treat the same stable UUID + room + authenticated host as the same operation;
+    -- reject attempts to reuse someone else's UUID or to change its room.
+    if not found then
+        if not exists (
+            select 1 from public.matches m
+            where m.id = p_match_id
+              and m.room_id is not distinct from p_room_id)
+        then
+            raise exception 'match_id_conflict';
+        end if;
+
+        if not exists (
+            select 1 from public.match_players h
+            where h.match_id = p_match_id
+              and h.player_id = v_uid::text
+              and h.role = 'host')
+        then
+            raise exception 'not_host';
+        end if;
+
+        return p_match_id;
+    end if;
 
     insert into public.match_players (match_id, player_id, lumens, finish_rank, role)
-    values (v_match_id, p_host_player_id, 0, null, 'host');
+    values (p_match_id, v_uid::text, 0, null, 'host');
 
-    return v_match_id;
+    return p_match_id;
 end;
 $$;
 
--- record_match_result — upsert a match_players row. Host-only for OTHER players;
--- a player may record their OWN result (the host calls this on their behalf in
--- the normal flow, but allowing self-write is harmless and simplifies offline
--- reconcile). Lumens/rank come from the authoritative ILumenScoreboard.
+-- record_match_result — host-authoritative upsert of a match_players row.
+-- Lumens/rank come from the host's authoritative ILumenScoreboard.
 create or replace function public.record_match_result(
     p_match_id uuid,
     p_player_id text,
@@ -793,6 +822,7 @@ as $$
 declare
     v_uid uuid := auth.uid();
     v_caller_uid text;
+    v_caller_is_host boolean := false;
 begin
     if v_uid is null then raise exception 'not_authenticated'; end if;
     v_caller_uid := v_uid::text;
@@ -805,14 +835,37 @@ begin
         raise exception 'not_found';
     end if;
 
-    -- Host can write any player's row; a player may write their own.
-    if p_player_id <> v_caller_uid and not exists (
+    -- The existing host row is the sole authority source for result writes.
+    select exists (
         select 1 from public.match_players h
         where h.match_id = p_match_id
           and h.player_id = v_caller_uid
-          and h.role = 'host')
-    then
+          and h.role = 'host'
+    ) into v_caller_is_host;
+
+    if not coalesce(v_caller_is_host, false) then
         raise exception 'not_host';
+    end if;
+
+    if p_lumens is null or p_lumens < 0 then
+        raise exception 'bad_lumens';
+    end if;
+
+    -- finish_rank is 1-based and required when recording a final result.
+    if p_finish_rank is null or p_finish_rank < 1 then
+        raise exception 'bad_finish_rank';
+    end if;
+
+    -- Defense-in-depth: if the row already exists with role='host' for a different player,
+    -- refuse to overwrite it (prevents a host from demoting a co-host to steal host status, and
+    -- prevents a late-arriving self-escalation from replacing the real host's row).
+    if p_role = 'host' and exists (
+        select 1 from public.match_players existing
+        where existing.match_id = p_match_id
+          and existing.player_id <> p_player_id
+          and existing.role = 'host')
+    then
+        raise exception 'host_already_exists';
     end if;
 
     insert into public.match_players (match_id, player_id, lumens, finish_rank, role)
@@ -851,10 +904,55 @@ begin
     end if;
 
     update public.matches
-    set ended_at         = now(),
+    set ended_at         = coalesce(ended_at, now()),
         winner_player_id = p_winner_player_id,
         duration_seconds = p_duration_seconds
     where id = p_match_id;
+end;
+$$;
+
+-- finalize_match_with_results — the sole runtime persistence path. PostgreSQL functions execute
+-- in a single transaction, so match creation, every standings row, and the end state all commit
+-- or none do. Nothing is persisted mid-match, preventing app termination from orphaning an open
+-- match row. The stable replay UUID makes lost-response retries idempotent.
+drop function if exists public.finalize_match_with_results(uuid, jsonb, text, int);
+create or replace function public.finalize_match_with_results(
+    p_match_id uuid,
+    p_room_id text,
+    p_host_player_id text,
+    p_results jsonb,
+    p_winner_player_id text,
+    p_duration_seconds int
+)
+returns void
+language plpgsql security definer set search_path = public
+as $$
+declare
+    v_result jsonb;
+begin
+    if p_results is null
+       or jsonb_typeof(p_results) <> 'array'
+       or jsonb_array_length(p_results) = 0
+    then
+        raise exception 'bad_results';
+    end if;
+
+    perform public.create_match(p_room_id, p_host_player_id, p_match_id);
+
+    for v_result in select value from jsonb_array_elements(p_results)
+    loop
+        perform public.record_match_result(
+            p_match_id,
+            v_result ->> 'player_id',
+            (v_result ->> 'lumens')::int,
+            (v_result ->> 'finish_rank')::int,
+            v_result ->> 'role');
+    end loop;
+
+    perform public.finalize_match(
+        p_match_id,
+        nullif(p_winner_player_id, ''),
+        greatest(0, p_duration_seconds));
 end;
 $$;
 

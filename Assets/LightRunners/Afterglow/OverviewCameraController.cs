@@ -68,12 +68,31 @@ namespace LightRunners.Afterglow
 
         private void Awake()
         {
-            _camera = GetComponent<Camera>();
-            _camera.orthographic = true;
-            _camera.orthographicSize = minOrthoSize;
+            EnsureInitialized();
+        }
 
-            _container = new GameObject("AfterglowOverview_Content").transform;
-            _container.SetParent(transform, false);
+        /// <summary>
+        /// Lazily resolve the Camera and container. Awake is not guaranteed to fire in
+        /// EditMode tests when AddComponent creates the controller, so Show/Hide must
+        /// be safe to call before Unity has invoked Awake.
+        /// </summary>
+        private void EnsureInitialized()
+        {
+            if (_camera == null)
+            {
+                _camera = GetComponent<Camera>();
+                if (_camera != null)
+                {
+                    _camera.orthographic = true;
+                    _camera.orthographicSize = minOrthoSize;
+                }
+            }
+
+            if (_container == null)
+            {
+                _container = new GameObject("AfterglowOverview_Content").transform;
+                _container.SetParent(transform, false);
+            }
         }
 
         private void OnDestroy()
@@ -92,6 +111,7 @@ namespace LightRunners.Afterglow
         /// </summary>
         public void Show(ReplayPackage package)
         {
+            EnsureInitialized();
             ClearSpawned();
             if (package == null)
             {
@@ -124,7 +144,8 @@ namespace LightRunners.Afterglow
         public void Hide()
         {
             IsShown = false;
-            _camera.enabled = false;
+            EnsureInitialized();
+            if (_camera != null) _camera.enabled = false;
             gameObject.SetActive(false);
             ClearSpawned();
         }

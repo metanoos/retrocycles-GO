@@ -132,19 +132,26 @@ namespace LightRunners.Multiplayer
 
         /// <summary>
         /// Propagate the host's frozen value into this peer's local
-        /// <see cref="ITailAuthority"/> (resolved via locator). Best-effort: if
-        /// no ITailAuthority is registered (pre-Track-A wiring) the value is
-        /// dropped, which is correct because in that case no tail consumer is
-        /// using the frozen radius yet.
+        /// <see cref="ITailAuthority"/> (resolved via locator) via
+        /// <see cref="ITailAuthority.TryApplyNetworkedFreeze"/>. Best-effort: if no
+        /// ITailAuthority is registered (pre-Track-A wiring) the value is dropped, which is
+        /// correct because in that case no tail consumer is using the frozen radius yet.
         ///
         /// The client rederives all collision/clearance fields from integer centimetres and
         /// rejects the room state if the fixed player radius contract or hash does not match.
+        /// A replicated sentinel resets the local authority so the next match can freeze a new
+        /// host config.
         /// </summary>
         private void ApplyFrozenRadiusToLocalTailAuthority()
         {
-            if (!HasFrozenTailRadius) return;
             if (ServiceLocator.TryGet<ITailAuthority>(out var tail) && tail != null)
             {
+                if (FrozenTailRadius == UnfrozenSentinel)
+                {
+                    tail.Unfreeze();
+                    return;
+                }
+
                 int tailRadiusCm = Mathf.RoundToInt(FrozenTailRadius * 100f);
                 if (FrozenPlayerHeadRadiusCm != FrozenMatchConfig.PlayerHeadRadiusCm)
                 {
@@ -163,9 +170,9 @@ namespace LightRunners.Multiplayer
 
         public override void Spawned()
         {
-            // Late joiners may spawn after the value was frozen and therefore cannot rely on a
-            // future OnChanged callback. Validate the initial replicated snapshot immediately.
-            if (!Object.HasStateAuthority && HasFrozenTailRadius)
+            // Late joiners cannot rely on a future OnChanged callback. Apply the initial snapshot
+            // even when it is unfrozen, so a reused local authority cannot retain the prior match.
+            if (!Object.HasStateAuthority)
                 ApplyFrozenRadiusToLocalTailAuthority();
         }
     }

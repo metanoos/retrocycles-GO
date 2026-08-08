@@ -48,12 +48,13 @@ namespace LightRunners.Location
             Initialize();
         }
 
-        protected virtual void OnDestroy()
+        protected override void OnDestroy()
         {
             AltitudeService?.Dispose();
 #if !UNITY_EDITOR
             if (GPSActive) Input.location.Stop();
 #endif
+            base.OnDestroy();
         }
 
         public void Initialize()

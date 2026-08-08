@@ -2,6 +2,21 @@ using System;
 
 namespace LightRunners.Core
 {
+    /// <summary>Unambiguous crash signal shared by collision, networking, and gameplay.</summary>
+    public readonly struct PlayerCrashEvent
+    {
+        public string CrashedPlayerId { get; }
+        public string CausedByPlayerId { get; }
+        public GeoPoint At { get; }
+
+        public PlayerCrashEvent(string crashedPlayerId, string causedByPlayerId, GeoPoint at)
+        {
+            CrashedPlayerId = crashedPlayerId ?? string.Empty;
+            CausedByPlayerId = causedByPlayerId ?? string.Empty;
+            At = at;
+        }
+    }
+
     /// <summary>
     /// Static event bus for cross-assembly notifications that would otherwise create a
     /// dependency cycle (spec §3.2). <see cref="PlayerCrashed"/> lets Multiplayer raise a
@@ -11,8 +26,11 @@ namespace LightRunners.Core
     /// </summary>
     public static class GameEvents
     {
-        /// <summary>Raised by either the Fusion path or the fallback collision detector when the local player crashes.</summary>
-        public static event Action<string> PlayerCrashed;
+        /// <summary>Raised after collision identifies both the moving runner and trail owner.</summary>
+        public static event Action<PlayerCrashEvent> PlayerCrashed;
+
+        /// <summary>Raised after the respawn grace window ends and collision may rearm.</summary>
+        public static event Action<string> PlayerRespawned;
 
         /// <summary>Raised by <c>GameManager</c> when the active state machine transitions (spec §2.3).</summary>
         public static event Action<GameState, GameState> GameStateChanged;
@@ -48,8 +66,12 @@ namespace LightRunners.Core
         /// <summary>Leader changed (decisions F, I). newLeaderId is empty string on tie/null.</summary>
         public static event Action<string> LeaderChanged;
 
-        /// <summary>A runner collected a Lumen Gate (decisions C, E, G). (gateId.Value, collectorPlayerId).</summary>
-        public static event Action<int, string> GateCollected;
+        /// <summary>
+        /// An authoritative Gate/Pickup owner accepted a Lumen collection (decisions C, E, G).
+        /// Presentation triggers are requests and must not raise this directly. Arguments are
+        /// (gateId.Value, collectorPlayerId, authoritative collection position).
+        /// </summary>
+        public static event Action<int, string, GeoPoint> GateCollected;
 
         /// <summary>A Gate spawned (decision G/L/M). (gateId.Value, lat, lon, alt, placement).</summary>
         public static event Action<int, double, double, double, GatePlacement> GateSpawned;
@@ -66,8 +88,11 @@ namespace LightRunners.Core
         public static void RaisePlayerLevelChanged(int level)
             => PlayerLevelChanged?.Invoke(level);
 
-        public static void RaisePlayerCrashed(string causedByPlayerId)
-            => PlayerCrashed?.Invoke(causedByPlayerId);
+        public static void RaisePlayerCrashed(string crashedPlayerId, string causedByPlayerId, GeoPoint at)
+            => PlayerCrashed?.Invoke(new PlayerCrashEvent(crashedPlayerId, causedByPlayerId, at));
+
+        public static void RaisePlayerRespawned(string playerId)
+            => PlayerRespawned?.Invoke(playerId);
 
         public static void RaiseGameStateChanged(GameState previous, GameState next)
             => GameStateChanged?.Invoke(previous, next);
@@ -89,8 +114,8 @@ namespace LightRunners.Core
         public static void RaiseLeaderChanged(string leaderId)
             => LeaderChanged?.Invoke(leaderId);
 
-        public static void RaiseGateCollected(int gateIdValue, string collectorPlayerId)
-            => GateCollected?.Invoke(gateIdValue, collectorPlayerId);
+        public static void RaiseGateCollected(int gateIdValue, string collectorPlayerId, GeoPoint at)
+            => GateCollected?.Invoke(gateIdValue, collectorPlayerId, at);
 
         public static void RaiseGateSpawned(int gateIdValue, double lat, double lon, double alt, GatePlacement placement)
             => GateSpawned?.Invoke(gateIdValue, lat, lon, alt, placement);
@@ -104,7 +129,32 @@ namespace LightRunners.Core
         public static void RaiseMatchExpired()
             => MatchExpired?.Invoke();
 
-        // Intentionally not providing an Unsubscribe-all: subscribers must manage their own
-        // lifetimes to avoid silent leaks across scene loads.
+        // Intentionally not providing an Unsubscribe-all for production: subscribers must manage
+        // their own lifetimes to avoid silent leaks across scene loads. The TEST-ONLY helper
+        // below exists so unit tests can isolate themselves from earlier tests' subscriptions.
+#if UNITY_INCLUDE_TESTS
+        /// <summary>
+        /// TEST-ONLY: clear every subscriber from every event. Used by EditMode tests that
+        /// exercise the bus to keep test isolation. Production code MUST NOT call this — it
+        /// would silently detach every legitimate subscriber (Gameplay, Multiplayer, AR, etc.).
+        /// </summary>
+        internal static void ClearSubscribersForTests()
+        {
+            PlayerCrashed = null;
+            PlayerRespawned = null;
+            GameStateChanged = null;
+            ViewModeChanged = null;
+            ConnectionStateChanged = null;
+            PlayerLevelChanged = null;
+            MatchStateChanged = null;
+            LumensChanged = null;
+            LeaderChanged = null;
+            GateCollected = null;
+            GateSpawned = null;
+            GateDespawned = null;
+            BoundaryViolated = null;
+            MatchExpired = null;
+        }
+#endif
     }
 }

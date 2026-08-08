@@ -103,6 +103,8 @@ namespace LightRunners.Core
         [Min(1f)] public float lightfieldDomeCeilingMeters = 6f;
         [Tooltip("Legacy inspector mirror of the locked 4 m collision microsegment. Live match collision uses FrozenMatchConfig.CollisionMicrosegmentMeters.")]
         [Min(0.5f)] public float sweepSubdivideMaxStepMeters = 4f;
+        [Tooltip("Host-side HMAC secret for referee-token issuance (decision R). Blank by default — a host with no configured secret fails CLOSED on referee-token validation (PlaceBonusGate rejects) so a misconfigured host can't mint tokens. Fill per-environment; do NOT commit a real secret (spec pitfall #10).")]
+        public string refereeTokenSecret = "";
 
         /// <summary>Cached lazy load of <c>Resources/GameConfig.asset</c>.</summary>
         private static GameConfig _cached;
