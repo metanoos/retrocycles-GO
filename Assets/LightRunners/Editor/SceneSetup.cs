@@ -119,7 +119,10 @@ namespace LightRunners.Editor
             new GameObject("GPSPowerManager", typeof(Location.GPSPowerManager));
 
             // Map/ minimap (spec §10.2): corner RawImages (tiles + overlay) + expand button.
-            var mapCanvas = MakeCanvas("Map", 1080, 1920, sortingOrder: -1);
+            // ScreenSpaceCamera so the 3D MainCamera (top half) renders on top of the map
+            // (bottom half) — Pokemon Go style: neon trails + lumen gates in 3D above, map below.
+            var mapCanvas = MakeCanvas("Map", 1080, 1920, sortingOrder: -1,
+                renderMode: RenderMode.ScreenSpaceCamera);
             var mapGroup = mapCanvas.gameObject.AddComponent<CanvasGroup>();
             mapGroup.alpha = 1f;
 
@@ -172,6 +175,12 @@ namespace LightRunners.Editor
             mainCamComp.depth = 0;
             mainCam.transform.position = new Vector3(0, 50, 0);
             mainCam.transform.rotation = Quaternion.Euler(90, 0, 0);
+
+            // Wire the map canvas to render behind the 3D camera. ScreenSpaceCamera
+            // mode requires a worldCamera; the canvas renders at planeDistance behind
+            // everything the camera draws, so 3D trails/gates appear on top.
+            mapCanvas.worldCamera = mainCamComp;
+            mapCanvas.planeDistance = 100f;
 
             // AR UI canvas group (alpha 0; cross-faded against the map by ViewTransitionManager).
             var arCanvas = MakeCanvas("ARCanvas", 1080, 1920, sortingOrder: -2);
