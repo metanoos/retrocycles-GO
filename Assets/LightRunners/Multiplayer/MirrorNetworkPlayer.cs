@@ -89,18 +89,29 @@ namespace LightRunners.Multiplayer
             // on this component for the local player's avatar.
             syncDirection = SyncDirection.ClientToServer;
 
-            // Also set on the trail sync component (same GO).
+            // Also set on the trail sync component (same GO). This also fixes GLM-H1/DS-H1:
+            // without ClientToServer, SyncList writes throw InvalidOperationException on
+            // the owning client because the default ServerToClient direction makes the
+            // list read-only for non-server peers.
             var trailSync = GetComponent<MirrorNetworkTrailSync>();
             if (trailSync != null) trailSync.syncDirection = SyncDirection.ClientToServer;
 
-            // M2 fix: clients send their own player ID to the host via Command.
-            // The host's OnServerAddPlayer stamps the host's ID; clients must
-            // self-report because the host doesn't know the client's identity.
-            // Uses reflection to avoid a circular Multiplayer→Gameplay dependency.
-            if (HasInputAuthorityOnly)
+            // GLM-C3 fix: StampLocalIdentity is unreliable when called from OnServerAddPlayer
+            // because Mirror queues the isLocalPlayer flag for next frame. Stamp here in
+            // OnStartLocalPlayer instead, which fires AFTER isLocalPlayer is set.
+            string myId = ResolveLocalPlayerIdReflective();
+            if (!string.IsNullOrEmpty(myId))
             {
-                string myId = ResolveLocalPlayerIdReflective();
-                if (!string.IsNullOrEmpty(myId))
+                PlayerId = myId;
+                _runnerIdentity?.SetPlayerId(myId);
+                var form = BeaconFormManager.HasInstance
+                    ? BeaconFormManager.Instance.SelectedForm
+                    : BeaconFormType.Hoverboard;
+                BeaconForm = (int)form;
+
+                // Clients send their ID to the host via Command (M2 fix).
+                // The host is already the server, so its local write is authoritative.
+                if (HasInputAuthorityOnly)
                     CmdSetPlayerId(myId);
             }
 

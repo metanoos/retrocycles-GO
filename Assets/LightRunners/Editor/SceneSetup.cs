@@ -349,15 +349,11 @@ namespace LightRunners.Editor
             // OffScreenIndicator, LeaderCrown.
             BuildMatchHUD();
 
-            // NetworkMatchState (Track C — decisions Q/T): the HOST spawns the
-            // authoritative NetworkObject at match start from
-            // Resources/Player/NetworkMatchState.prefab (see PrefabSetup).
-            // The scene does NOT place a NetworkMatchState GameObject —
-            // spawning from a prefab is the canonical Fusion pattern
-            // (NetworkObjects can only live on a NetworkRunner, not in a
-            // static scene). The host-side MatchManager resolves the prefab
-            // and calls Runner.Spawn. No scene wiring required; this comment
-            // exists for integration readers.
+            // NetworkMatchState (Track C — decisions Q/T): the host-authoritative
+            // frozen tail-radius state. GLM-C1 fix: the old code never spawned this
+            // object, making PublishFrozenConfigToNetwork dead. Place it in the scene
+            // with a NetworkIdentity so the host owns it and SyncVars replicate to clients.
+            TryAddMirrorMatchState();
 
             EnsureEventSystem();
 
@@ -507,6 +503,35 @@ namespace LightRunners.Editor
             catch (Exception e)
             {
                 Debug.LogWarning($"[SceneSetup] Could not add {fullTypeName}: {e.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Add the MirrorNetworkMatchState to the scene with a NetworkIdentity.
+        /// GLM-C1 fix: without this GameObject, PublishFrozenConfigToNetwork can't
+        /// find the state object and the frozen tail radius (decision T) is never
+        /// replicated to clients.
+        /// </summary>
+        private static void TryAddMirrorMatchState()
+        {
+            try
+            {
+                Type stateType = FindTypeByName("LightRunners.Multiplayer.MirrorNetworkMatchState");
+                if (stateType == null || !stateType.IsSubclassOf(typeof(MonoBehaviour)))
+                {
+                    Debug.Log("[SceneSetup] MirrorNetworkMatchState type not found — skipping.");
+                    return;
+                }
+
+                var go = new GameObject("MirrorNetworkMatchState");
+                // NetworkIdentity is required for any NetworkBehaviour to function.
+                Type identityType = FindTypeByName("Mirror.NetworkIdentity");
+                if (identityType != null) go.AddComponent(identityType);
+                go.AddComponent(stateType);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[SceneSetup] Could not add MirrorNetworkMatchState: {e.Message}");
             }
         }
 
