@@ -557,7 +557,8 @@ namespace LightRunners.Editor
                 // CRITICAL: Mirror's NetworkManager requires a Transport component
                 // on the same GameObject. Without it, StartHost() NREs inside
                 // NetworkServer.Listen(). KCP (UDP) is Mirror's default transport.
-                Type transportType = FindTypeByName("Mirror.KcpTransport");
+                // The class is kcp2k.KcpTransport (not Mirror.KcpTransport).
+                Type transportType = FindTypeByName("kcp2k.KcpTransport");
                 if (transportType != null)
                 {
                     go.AddComponent(transportType);
