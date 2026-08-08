@@ -81,6 +81,33 @@ namespace LightRunners.Editor
         }
 
         /// <summary>
+        /// Mirror prefab generation (free open-source networking — replaces Fusion).
+        /// Generates <c>Resources/Player/MirrorPlayer.prefab</c> with the Mirror
+        /// components: NetworkIdentity + MirrorNetworkPlayer + MirrorNetworkTrailSync.
+        /// The MirrorLauncher (NetworkManager) references this as its playerPrefab.
+        /// </summary>
+        [MenuItem("Light-Runners/Setup/Mirror Player Prefab")]
+        public static void GenerateMirrorPlayerPrefab()
+        {
+            if (!AssetDatabase.IsValidFolder(NetworkPlayerDir))
+            {
+                Directory.CreateDirectory(NetworkPlayerDir);
+                AssetDatabase.Refresh();
+            }
+            const string path = NetworkPlayerDir + "/MirrorPlayer.prefab";
+            if (File.Exists(path)) return;
+
+            var go = new GameObject("MirrorPlayer");
+            // Mirror: NetworkIdentity is the equivalent of Fusion's NetworkObject.
+            AddComponentByName(go, "Mirror.NetworkIdentity");
+            AddComponentByName(go, "LightRunners.Multiplayer.MirrorNetworkPlayer");
+            AddComponentByName(go, "LightRunners.Multiplayer.MirrorNetworkTrailSync");
+            PrefabUtility.SaveAsPrefabAsset(go, path);
+            UnityEngine.Object.DestroyImmediate(go);
+            Debug.Log("[PrefabSetup] MirrorPlayer prefab generated at " + path);
+        }
+
+        /// <summary>
         /// Track C (decision Q/T) — host-side authoritative match-state
         /// NetworkObject. The host spawns one per match at match start; it
         /// carries the networked <c>FrozenTailRadius</c> so every peer renders
@@ -176,6 +203,7 @@ namespace LightRunners.Editor
         {
             GenerateBeaconPrefabs();
             GenerateNetworkPlayerPrefab();
+            GenerateMirrorPlayerPrefab();
             // Lightfield match core (Track G): gates + NetworkMatchState.
             GenerateGatePrefabs();
             GenerateNetworkMatchStatePrefab();

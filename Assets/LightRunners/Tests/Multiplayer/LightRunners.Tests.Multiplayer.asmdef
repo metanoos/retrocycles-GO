@@ -6,6 +6,7 @@
         "LightRunners.Multiplayer",
         "LightRunners.Trail",
         "LightRunners.Location",
+        "Mirror",
         "UnityEngine.TestRunner",
         "UnityEditor.TestRunner"
     ],

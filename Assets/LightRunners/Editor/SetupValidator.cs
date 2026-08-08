@@ -100,7 +100,11 @@ namespace LightRunners.Editor
 
             // Fusion presence
             bool fusion = TypeExists("Fusion.NetworkRunner");
-            sb.AppendLine($"[{(fusion ? "PASS" : "WARN")}] Photon Fusion present (needed only for phase 8 multiplayer)");
+            sb.AppendLine($"[{(fusion ? "PASS" : "WARN")}] Photon Fusion present (optional — Mirror is the default networking)");
+
+            // Mirror presence (free open-source default networking)
+            bool mirror = TypeExists("Mirror.NetworkManager");
+            sb.AppendLine($"[{(mirror ? "PASS" : "WARN")}] Mirror networking present (free multiplayer — replaces Fusion)");
 
             // Custom shaders (phase 11)
             int shaders = 0;

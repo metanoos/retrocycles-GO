@@ -6,7 +6,8 @@
         "LightRunners.Location",
         "LightRunners.Trail",
         "LightRunners.Beacon",
-        "LightRunners.Lightfield"
+        "LightRunners.Lightfield",
+        "Mirror"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
