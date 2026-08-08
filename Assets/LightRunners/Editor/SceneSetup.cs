@@ -529,6 +529,20 @@ namespace LightRunners.Editor
                 var go = new GameObject("MirrorLauncher");
                 var launcher = go.AddComponent(launcherType);
 
+                // CRITICAL: Mirror's NetworkManager requires a Transport component
+                // on the same GameObject. Without it, StartHost() NREs inside
+                // NetworkServer.Listen(). KCP (UDP) is Mirror's default transport.
+                Type transportType = FindTypeByName("Mirror.KcpTransport");
+                if (transportType != null)
+                {
+                    go.AddComponent(transportType);
+                }
+                else
+                {
+                    Debug.LogError("[SceneSetup] KcpTransport type not found! " +
+                                   "StartHost() will fail without a transport.");
+                }
+
                 // Wire the playerPrefab if the MirrorPlayer prefab exists.
                 var prefab = AssetDatabase.LoadAssetAtPath<GameObject>(
                     "Assets/Resources/Player/MirrorPlayer.prefab");

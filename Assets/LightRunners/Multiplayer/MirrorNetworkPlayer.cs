@@ -27,6 +27,10 @@ namespace LightRunners.Multiplayer
         [SyncVar] public int BeaconForm;
         [SyncVar(hook = nameof(OnCrashedChanged))]
         public bool IsCrashed;
+        // Position/heading SyncVars: client-authoritative (C2 fix). The local player
+        // writes GPS position and Mirror replicates to the host + other clients.
+        // syncDirection is set to ClientToServer in OnStartLocalPlayer (this Mirror
+        // version doesn't support syncDirection via [SyncVar] attribute parameter).
         [SyncVar] public float PositionX;
         [SyncVar] public float PositionY;
         [SyncVar] public float PositionZ;
@@ -49,7 +53,7 @@ namespace LightRunners.Multiplayer
         /// <summary>TRUE on a client peer for its own avatar.</summary>
         public bool HasInputAuthorityOnly => isLocalPlayer && !isServer;
 
-        /// <summary>Set by MirrorLauncher right after spawn (local player only).</summary>
+        /// <summary>Set by MirrorLauncher right after spawn (host-side, host's own player only).</summary>
         public void StampLocalIdentity(string playerId, bool isHost)
         {
             // Only stamp on the owner's side. For the host, that's isLocalPlayer.
@@ -62,9 +66,43 @@ namespace LightRunners.Multiplayer
             BeaconForm = (int)form;
         }
 
+        /// <summary>
+        /// Client-side identity stamp: called from OnStartLocalPlayer on clients to
+        /// send their own player ID to the host via a Command (M2 fix). The host's
+        /// OnServerAddPlayer stamps the host's ID directly; clients need this path
+        /// because _localPlayerId on the host is the HOST's id, not the client's.
+        /// </summary>
+        [Command]
+        public void CmdSetPlayerId(string playerId)
+        {
+            if (string.IsNullOrEmpty(playerId)) return;
+            PlayerId = playerId;
+        }
+
         public override void OnStartLocalPlayer()
         {
             base.OnStartLocalPlayer();
+
+            // C2 fix: set client-authoritative sync direction so GPS position writes
+            // replicate to the host. Mirror's default is ServerToClient which silently
+            // drops client writes. syncDirection is per-NetworkBehaviour, so we set it
+            // on this component for the local player's avatar.
+            syncDirection = SyncDirection.ClientToServer;
+
+            // Also set on the trail sync component (same GO).
+            var trailSync = GetComponent<MirrorNetworkTrailSync>();
+            if (trailSync != null) trailSync.syncDirection = SyncDirection.ClientToServer;
+
+            // M2 fix: clients send their own player ID to the host via Command.
+            // The host's OnServerAddPlayer stamps the host's ID; clients must
+            // self-report because the host doesn't know the client's identity.
+            // Uses reflection to avoid a circular Multiplayer→Gameplay dependency.
+            if (HasInputAuthorityOnly)
+            {
+                string myId = ResolveLocalPlayerIdReflective();
+                if (!string.IsNullOrEmpty(myId))
+                    CmdSetPlayerId(myId);
+            }
 
             // Beacon visual on a child GO (spec §8.3).
             var beaconGo = new GameObject("Beacon");
@@ -317,6 +355,30 @@ namespace LightRunners.Multiplayer
             _haveLast = false;
             if (_detector != null && LocationProvider.HasInstance)
                 _detector.BeginRun(LocationProvider.Instance.CurrentPosition);
+        }
+
+        /// <summary>
+        /// Reflectively resolve GameManager.Instance.LocalPlayerId to avoid a
+        /// circular Multiplayer→Gameplay assembly dependency (M2 fix).
+        /// </summary>
+        private static string ResolveLocalPlayerIdReflective()
+        {
+            try
+            {
+                var gmType = System.Type.GetType(
+                    "LightRunners.Gameplay.GameManager, LightRunners.Gameplay");
+                if (gmType == null) return null;
+                var hasInstanceProp = gmType.GetProperty("HasInstance");
+                if (hasInstanceProp != null && !(bool)hasInstanceProp.GetValue(null))
+                    return null;
+                var instanceProp = gmType.GetProperty("Instance");
+                if (instanceProp == null) return null;
+                var instance = instanceProp.GetValue(null);
+                if (instance == null) return null;
+                var idProp = gmType.GetProperty("LocalPlayerId");
+                return idProp?.GetValue(instance) as string;
+            }
+            catch { return null; }
         }
     }
 }

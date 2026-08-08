@@ -22,6 +22,8 @@ namespace LightRunners.Multiplayer
     {
         public const int MaxBatchPoints = 16;
 
+        // Trail batch SyncVars: client-authoritative (C2 fix). syncDirection is set
+        // to ClientToServer in MirrorNetworkPlayer.OnStartLocalPlayer for this GO.
         [SyncVar] public int BatchStart;
         [SyncVar] public int BatchCount;
         [SyncVar] public int BatchSeq;
@@ -47,18 +49,15 @@ namespace LightRunners.Multiplayer
             base.OnStartClient();
             _nextSendSequence = 0;
             _lastAppliedSeq = 0;
-            Batch.Callback += OnBatchChanged;
+            // M1 fix: do NOT subscribe to Batch.Callback. SyncList<float>.Clear()+Add()
+            // fires N callbacks during deserialization, each triggering PullRemoteTrail()
+            // with a partially-populated list. The Update() poll gated by BatchSeq is
+            // sufficient and avoids the corrupt intermediate reads.
         }
 
         public override void OnStopClient()
         {
             base.OnStopClient();
-            Batch.Callback -= OnBatchChanged;
-        }
-
-        private void OnBatchChanged(SyncList<float>.Operation op, int itemIndex, float oldItem, float newItem)
-        {
-            PullRemoteTrail();
         }
 
         private void Update()
