@@ -250,10 +250,14 @@ namespace LightRunners.Gameplay.Tests
             director.ConfigureForPlayers(1, 1f);
             Assert.Greater(spawned.Value, 0);
 
-            Assert.IsTrue(director.TryCollectGate(spawned, "runner-gate"));
+            // Capture the original id BEFORE collecting — density-gate respawn fires
+            // GateSpawned again, which would overwrite `spawned` with the new gate's id.
+            GateId staleId = spawned;
+
+            Assert.IsTrue(director.TryCollectGate(staleId, "runner-gate"));
             Assert.AreEqual(1, _match.Scoreboard.GetLumens("runner-gate"));
 
-            Assert.IsFalse(director.TryCollectGate(spawned, "runner-gate"));
+            Assert.IsFalse(director.TryCollectGate(staleId, "runner-gate"));
             Assert.AreEqual(1, _match.Scoreboard.GetLumens("runner-gate"),
                 "a deferred-destroy stale visual must not award a second Lumen");
         }
