@@ -168,7 +168,8 @@ namespace LightRunners.Editor
             // MainCamera (top-down, depth 0)
             var mainCam = new GameObject("MainCamera", typeof(Camera));
             mainCam.tag = "MainCamera";
-            mainCam.GetComponent<Camera>().depth = 0;
+            var mainCamComp = mainCam.GetComponent<Camera>();
+            mainCamComp.depth = 0;
             mainCam.transform.position = new Vector3(0, 50, 0);
             mainCam.transform.rotation = Quaternion.Euler(90, 0, 0);
 
@@ -373,11 +374,12 @@ namespace LightRunners.Editor
             }
         }
 
-        private static Canvas MakeCanvas(string name, int width, int height, int sortingOrder = 0)
+        private static Canvas MakeCanvas(string name, int width, int height, int sortingOrder = 0,
+            RenderMode renderMode = RenderMode.ScreenSpaceOverlay)
         {
             var go = new GameObject(name, typeof(Canvas), typeof(CanvasScaler), typeof(GraphicRaycaster));
             var c = go.GetComponent<Canvas>();
-            c.renderMode = RenderMode.ScreenSpaceOverlay;
+            c.renderMode = renderMode;
             c.sortingOrder = sortingOrder;
 
             var scaler = go.GetComponent<CanvasScaler>();
